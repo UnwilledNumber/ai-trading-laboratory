@@ -6,6 +6,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from backtest import run_backtest, summarize_trades
+
 from scanner import (
     fetch_universe, scan_market, load_watchlist, save_watchlist,
     fetch_chart_data, DEFAULT_WATCHLIST, DATA_NOTE
@@ -136,6 +138,69 @@ else:
         st.write(f"RSI: {row['rsi14']:.1f} · Relative volume: {row['rvol']:.2f}x")
     with tab3:
         st.download_button("Download scan results (CSV)",results.to_csv(index=False).encode("utf-8"),"market_scan_results.csv","text/csv",use_container_width=True)
+
+
+st.divider()
+st.header("Historical Backtesting")
+st.caption("Evaluate the scanner's rules on historical bars. Backtests are simulations, not forecasts.")
+with st.expander("Backtest settings", expanded=False):
+    bt_symbols_text = st.text_input(
+        "Ticker symbols to test (comma-separated)",
+        value="AAPL,MSFT,NVDA,AMZN,META",
+        key="bt_symbols",
+    )
+    bt_horizon = st.selectbox("Historical timeframe", ["Swing", "Day trading"], key="bt_horizon")
+    bt_direction = st.selectbox("Direction", ["Both", "LONG", "SHORT"], key="bt_direction")
+    bt_min_score = st.slider("Minimum signal score", 0, 100, 60, 5, key="bt_min_score")
+    bt_stop_atr = st.selectbox("Stop distance (ATR)", [1.0, 1.5, 2.0], index=1, key="bt_stop")
+    bt_target_r = st.selectbox("Profit target (R multiple)", [1.0, 1.5, 2.0, 3.0], index=2, key="bt_target")
+    bt_slippage = st.selectbox("Slippage per side (basis points)", [0.0, 5.0, 10.0, 20.0], index=1, key="bt_slippage")
+    bt_fees = st.selectbox("Fees per side (basis points)", [0.0, 0.5, 1.0, 2.0], index=0, key="bt_fees")
+    run_bt = st.button("Run historical backtest", type="primary", key="run_backtest")
+
+if run_bt:
+    bt_symbols = [s.strip().upper() for s in bt_symbols_text.split(",") if s.strip()]
+    if not bt_symbols:
+        st.error("Enter at least one ticker symbol.")
+    else:
+        with st.spinner("Downloading historical bars and simulating trades. Intraday history is limited to approximately five trading days by the current provider."):
+            bt_trades = run_backtest(
+                bt_symbols, horizon=bt_horizon, direction=bt_direction,
+                min_score=bt_min_score, min_price=2.0,
+                min_dollar_volume=5_000_000, stop_atr=float(bt_stop_atr),
+                target_r=float(bt_target_r), slippage_bps=float(bt_slippage),
+                fee_bps_per_side=float(bt_fees),
+            )
+        st.session_state["bt_trades"] = bt_trades
+        st.session_state["bt_summary"], st.session_state["bt_equity"] = summarize_trades(bt_trades)
+
+if "bt_trades" in st.session_state:
+    bt_trades = st.session_state["bt_trades"]
+    bt_summary = st.session_state.get("bt_summary", {})
+    if bt_trades.empty:
+        st.warning("No trades were generated. Try a lower minimum score, a different ticker, or the swing timeframe.")
+    elif bt_summary:
+        st.subheader("Backtest results")
+        st.caption(f"{bt_horizon if 'bt_horizon' in locals() else 'Selected'} · Results are based on available historical bars, not a full-market test.")
+        m1,m2,m3 = st.columns(3)
+        m1.metric("Trades", bt_summary["trades"])
+        m2.metric("Win rate", f'{bt_summary["win_rate_pct"]:.1f}%')
+        m3.metric("Profit factor", f'{bt_summary["profit_factor"]:.2f}' if np.isfinite(bt_summary["profit_factor"]) else "∞")
+        m4,m5,m6 = st.columns(3)
+        m4.metric("Compounded net return", f'{bt_summary["net_return_pct_compounded"]:.2f}%')
+        m5.metric("Expectancy / trade", f'{bt_summary["expectancy_pct"]:.2f}%')
+        m6.metric("Maximum drawdown", f'{bt_summary["max_drawdown_pct"]:.2f}%')
+        equity = st.session_state.get("bt_equity", pd.DataFrame())
+        if not equity.empty:
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(x=equity["exit_time"], y=equity["equity_index"], mode="lines", name="Trade equity"))
+            fig_eq.update_layout(height=300, margin=dict(l=5,r=5,t=25,b=5), yaxis_title="Growth of $1")
+            st.plotly_chart(fig_eq, use_container_width=True)
+        st.write("**Trade log**")
+        display_cols = ["symbol","direction","signal_time","entry_time","exit_time","entry_price","exit_price","exit_reason","signal_score","net_return_pct"]
+        st.dataframe(bt_trades[display_cols].round(3), use_container_width=True, hide_index=True)
+        st.download_button("Download backtest trades (CSV)", bt_trades.to_csv(index=False).encode("utf-8"), "backtest_trades.csv", "text/csv", use_container_width=True)
+        st.caption("Methodology: signal is evaluated at bar close; entry is next bar open; stop/target are based on ATR at signal time. If stop and target both trade within one bar, stop is assumed first. Slippage and fees are deducted. No borrow fees, locate constraints, market impact, taxes, or survivorship-bias correction are included.")
 
 st.divider()
 st.subheader("Watchlist")
