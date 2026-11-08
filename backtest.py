@@ -242,6 +242,9 @@ def simulate_portfolio(
                 still_pending.append((exit_time, pnl, pos))
         pending_exits = still_pending
         active = [pos for pos in active if pos["exit_time"] > entry_time]
+        if any(pos["symbol"] == str(trade["symbol"]) for pos in active):
+            skipped.append({**trade.to_dict(), "portfolio_status": "SKIPPED_DUPLICATE_SYMBOL"})
+            continue
         if len(active) >= int(max_positions):
             skipped.append({**trade.to_dict(), "portfolio_status": "SKIPPED_MAX_POSITIONS"})
             continue
@@ -356,22 +359,109 @@ def summarize_portfolio(
     return summary, equity_curve
 
 
-def summarize_by_strategy(allocated_trades: pd.DataFrame) -> pd.DataFrame:
-    if allocated_trades.empty or "portfolio_status" not in allocated_trades:
-        return pd.DataFrame()
-    taken = allocated_trades[allocated_trades["portfolio_status"] == "TAKEN"].copy()
-    if taken.empty:
-        return pd.DataFrame()
-    taken["strategy"] = taken["horizon"].astype(str) + " " + taken["direction"].astype(str)
-    rows = []
-    for strategy, group in taken.groupby("strategy"):
-        metrics = _trade_metrics(group)
-        metrics["strategy"] = strategy
-        metrics["portfolio_pnl"] = float(group["portfolio_pnl"].sum())
-        rows.append(metrics)
-    return pd.DataFrame(rows)[["strategy","trades","win_rate_pct","profit_factor",
-                               "average_trade_pct","portfolio_pnl"]]
 
+def summarize_by_strategy(allocated_trades: pd.DataFrame) -> pd.DataFrame:
+    """Report the four distinct horizon/direction combinations, including zero-trade rows."""
+    columns = ["strategy", "trades", "win_rate_pct", "profit_factor",
+               "average_trade_pct", "portfolio_pnl", "average_pnl_per_trade"]
+    if allocated_trades.empty or "portfolio_status" not in allocated_trades:
+        return pd.DataFrame(columns=columns)
+    taken = allocated_trades[allocated_trades["portfolio_status"] == "TAKEN"].copy()
+    expected = [
+        ("Swing", "LONG"), ("Swing", "SHORT"),
+        ("Day trading", "LONG"), ("Day trading", "SHORT"),
+    ]
+    rows = []
+    for horizon, direction in expected:
+        group = taken[
+            (taken["horizon"].astype(str) == horizon) &
+            (taken["direction"].astype(str) == direction)
+        ]
+        if group.empty:
+            rows.append({
+                "strategy": f"{horizon} {direction}", "trades": 0,
+                "win_rate_pct": np.nan, "profit_factor": np.nan,
+                "average_trade_pct": np.nan, "portfolio_pnl": 0.0,
+                "average_pnl_per_trade": np.nan,
+            })
+            continue
+        r = group["net_return_pct"].astype(float)
+        wins, losses = r[r > 0], r[r < 0]
+        gp, gl = float(wins.sum()), float(abs(losses.sum()))
+        pnl = group["portfolio_pnl"].astype(float)
+        rows.append({
+            "strategy": f"{horizon} {direction}",
+            "trades": int(len(group)),
+            "win_rate_pct": float((r > 0).mean() * 100),
+            "profit_factor": gp / gl if gl > 0 else (float("inf") if gp > 0 else 0.0),
+            "average_trade_pct": float(r.mean()),
+            "portfolio_pnl": float(pnl.sum()),
+            "average_pnl_per_trade": float(pnl.mean()),
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_benchmark_report(symbols: list[str], horizons: list[str]) -> pd.DataFrame:
+    """Reference buy-and-hold returns for each symbol and data horizon.
+
+    This is a simple price-only benchmark, not a portfolio-equivalent comparison:
+    it excludes dividends, trading costs, position sizing, and cash allocation.
+    """
+    rows = []
+    for horizon in horizons:
+        for symbol in list(dict.fromkeys(s.strip().upper() for s in symbols if s.strip())):
+            try:
+                bars = _download_history(symbol, horizon)
+                if bars.empty or len(bars) < 2:
+                    continue
+                close = pd.to_numeric(bars["Close"], errors="coerce").dropna()
+                if len(close) < 2 or float(close.iloc[0]) <= 0:
+                    continue
+                equity = close / float(close.iloc[0])
+                drawdown = equity / equity.cummax() - 1.0
+                rows.append({
+                    "symbol": symbol,
+                    "horizon": horizon,
+                    "bars": int(len(close)),
+                    "start": str(close.index[0]),
+                    "end": str(close.index[-1]),
+                    "buy_hold_return_pct": float((equity.iloc[-1] - 1) * 100),
+                    "buy_hold_max_drawdown_pct": float(drawdown.min() * 100),
+                })
+            except Exception as exc:
+                print(f"Benchmark skipped {symbol} ({horizon}): {exc}")
+    return pd.DataFrame(rows)
+
+
+def summarize_sample_by_strategy(trades: pd.DataFrame, sample_name: str) -> pd.DataFrame:
+    """Trade-level in/out-of-sample diagnostics for all four strategy buckets."""
+    cols = ["sample", "strategy", "trades", "win_rate_pct",
+            "profit_factor", "mean_trade_pct"]
+    if trades.empty:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for horizon, direction in [
+        ("Swing", "LONG"), ("Swing", "SHORT"),
+        ("Day trading", "LONG"), ("Day trading", "SHORT"),
+    ]:
+        group = trades[
+            (trades["horizon"].astype(str) == horizon) &
+            (trades["direction"].astype(str) == direction)
+        ]
+        if group.empty:
+            continue
+        r = group["net_return_pct"].astype(float)
+        wins, losses = r[r > 0], r[r < 0]
+        gp, gl = float(wins.sum()), float(abs(losses.sum()))
+        rows.append({
+            "sample": sample_name,
+            "strategy": f"{horizon} {direction}",
+            "trades": int(len(group)),
+            "win_rate_pct": float((r > 0).mean() * 100),
+            "profit_factor": gp / gl if gl > 0 else (float("inf") if gp > 0 else 0.0),
+            "mean_trade_pct": float(r.mean()),
+        })
+    return pd.DataFrame(rows, columns=cols)
 
 def make_walk_forward_split(trades: pd.DataFrame, train_fraction: float = 0.70):
     if trades.empty:
