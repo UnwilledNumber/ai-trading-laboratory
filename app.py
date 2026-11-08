@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples)
+from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples, apply_market_regimes, summarize_by_regime)
 
 from scanner import (
     fetch_universe, scan_market, load_watchlist, save_watchlist,
@@ -178,6 +178,7 @@ if run_bt:
                 target_r=float(bt_target_r), slippage_bps=float(bt_slippage),
                 fee_bps_per_side=float(bt_fees),
             )
+            bt_trades = apply_market_regimes(bt_trades)
         allocated, equity = simulate_portfolio(
             bt_trades, starting_capital=float(bt_capital),
             risk_per_trade_pct=float(bt_risk), max_positions=int(bt_max_positions),
@@ -313,6 +314,36 @@ if "bt_trades" in st.session_state:
                 ticker_report.to_csv(index=False).encode("utf-8"),
                 "ticker_diagnostics.csv", "text/csv", use_container_width=True
             )
+
+        st.subheader("Stage 3.6 — Market regime analysis")
+        st.caption("SPY daily trend and volatility conditions are attached using information available on each signal date. These are raw candidate-trade statistics, not portfolio returns.")
+        regime_strategy = st.selectbox(
+            "Strategy for regime analysis",
+            ["Swing LONG", "Swing SHORT", "Day trading LONG", "Day trading SHORT"],
+            key="regime_strategy",
+        )
+        regime_horizon, regime_direction = regime_strategy.rsplit(" ", 1)
+        regime_subset = bt_trades[
+            (bt_trades["horizon"].astype(str).str.lower() == regime_horizon.lower()) &
+            (bt_trades["direction"].astype(str).str.upper() == regime_direction)
+        ].copy()
+        if regime_subset.empty:
+            st.info("No candidate trades exist for this strategy in the selected backtest.")
+        elif "market_regime" not in regime_subset.columns or regime_subset["market_regime"].eq("Unavailable").all():
+            st.warning("Market regime history could not be attached. Rerun the backtest after the SPY data provider is available.")
+        else:
+            trend_report = summarize_by_regime(regime_subset)
+            st.markdown("**Performance by market trend and volatility**")
+            st.dataframe(trend_report.round(3), use_container_width=True, hide_index=True)
+            ticker_regime = summarize_by_regime(regime_subset, group_by_ticker=True)
+            st.markdown("**Ticker performance inside each market regime**")
+            st.dataframe(ticker_regime.round(3), use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download regime analysis (CSV)",
+                ticker_regime.to_csv(index=False).encode("utf-8"),
+                "market_regime_diagnostics.csv", "text/csv", use_container_width=True
+            )
+            st.caption("Trend regime uses SPY close versus EMA50 and EMA200. Volatility regime compares SPY ATR(14) percentage with trailing 252-session 33rd/67th percentiles. Regime labels are descriptive filters, not predictive signals. Intraday trades inherit the latest available daily SPY regime.")
 
         st.write("**Trade log (portfolio allocations)**")
         display_cols = ["symbol","horizon","direction","signal_time","entry_time","exit_time",

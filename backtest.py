@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -30,6 +31,98 @@ def _download_history(symbol: str, horizon: str) -> pd.DataFrame:
     if frame.empty:
         return frame
     return add_indicators(frame, intraday=intraday)
+
+
+
+@lru_cache(maxsize=2)
+def _download_market_regime_history() -> pd.DataFrame:
+    """Download SPY daily bars and classify market conditions without look-ahead."""
+    raw = yf.download("SPY", period="5y", interval="1d", auto_adjust=True,
+                      progress=False, threads=False)
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    required = {"High", "Low", "Close"}
+    if not required.issubset(raw.columns):
+        return pd.DataFrame()
+    market = raw[["High", "Low", "Close"]].copy().dropna()
+    close = pd.to_numeric(market["Close"], errors="coerce")
+    market["EMA50"] = close.ewm(span=50, adjust=False).mean()
+    market["EMA200"] = close.ewm(span=200, adjust=False).mean()
+    previous = close.shift(1)
+    tr = pd.concat([market["High"] - market["Low"],
+                    (market["High"] - previous).abs(),
+                    (market["Low"] - previous).abs()], axis=1).max(axis=1)
+    market["ATR14_PCT"] = 100 * tr.ewm(alpha=1/14, adjust=False).mean() / close
+    q_low = market["ATR14_PCT"].rolling(252, min_periods=60).quantile(0.33)
+    q_high = market["ATR14_PCT"].rolling(252, min_periods=60).quantile(0.67)
+    market["volatility_regime"] = np.select(
+        [market["ATR14_PCT"] <= q_low, market["ATR14_PCT"] >= q_high],
+        ["Low volatility", "High volatility"], default="Normal volatility"
+    )
+    market["trend_regime"] = np.select(
+        [(close > market["EMA50"]) & (market["EMA50"] > market["EMA200"]),
+         (close < market["EMA50"]) & (market["EMA50"] < market["EMA200"])],
+        ["Bullish", "Bearish"], default="Sideways / mixed"
+    )
+    market["market_regime"] = market["trend_regime"] + " · " + market["volatility_regime"]
+    market.index = pd.to_datetime(market.index, errors="coerce", utc=True).tz_convert(None).normalize()
+    return market[["trend_regime", "volatility_regime", "market_regime", "ATR14_PCT"]].loc[lambda x: ~x.index.isna()]
+
+
+def apply_market_regimes(trades: pd.DataFrame) -> pd.DataFrame:
+    """Attach the latest known SPY regime on or before each trade signal date."""
+    if trades.empty:
+        return trades.copy()
+    out = trades.copy()
+    market = _download_market_regime_history()
+    if market.empty or "signal_time" not in out:
+        out["trend_regime"] = "Unavailable"
+        out["volatility_regime"] = "Unavailable"
+        out["market_regime"] = "Unavailable"
+        out["market_atr_pct"] = np.nan
+        return out
+    signal_dates = pd.to_datetime(out["signal_time"], errors="coerce", utc=True).dt.tz_convert(None).dt.normalize()
+    left = pd.DataFrame({"_row": np.arange(len(out)), "_date": signal_dates})
+    right = market.reset_index()
+    right = right.rename(columns={right.columns[0]: "_date"})
+    merged = pd.merge_asof(left.sort_values("_date"), right.sort_values("_date"),
+                           on="_date", direction="backward")
+    merged = merged.sort_values("_row")
+    out["trend_regime"] = merged["trend_regime"].fillna("Unavailable").to_numpy()
+    out["volatility_regime"] = merged["volatility_regime"].fillna("Unavailable").to_numpy()
+    out["market_regime"] = merged["market_regime"].fillna("Unavailable").to_numpy()
+    out["market_atr_pct"] = pd.to_numeric(merged["ATR14_PCT"], errors="coerce").to_numpy()
+    return out
+
+
+def summarize_by_regime(trades: pd.DataFrame, group_by_ticker: bool = False) -> pd.DataFrame:
+    """Summarize raw trade-candidate performance by SPY market regime."""
+    columns = ["market_regime", "symbol", "trades", "win_rate_pct", "profit_factor",
+               "mean_trade_pct", "average_win_pct", "average_loss_pct"]
+    if trades.empty or "market_regime" not in trades.columns:
+        return pd.DataFrame(columns=columns)
+    keys = ["market_regime"] + (["symbol"] if group_by_ticker else [])
+    rows = []
+    for key, group in trades.groupby(keys, dropna=False):
+        if not isinstance(key, tuple):
+            key = (key,)
+        returns = pd.to_numeric(group["net_return_pct"], errors="coerce").dropna()
+        if returns.empty:
+            continue
+        wins, losses = returns[returns > 0], returns[returns < 0]
+        gp, gl = float(wins.sum()), float(abs(losses.sum()))
+        pf = gp / gl if gl > 0 else (float("inf") if gp > 0 else 0.0)
+        row = {"market_regime": key[0], "symbol": key[1] if group_by_ticker else "ALL",
+               "trades": int(len(returns)), "win_rate_pct": float((returns > 0).mean()*100),
+               "profit_factor": pf, "mean_trade_pct": float(returns.mean()),
+               "average_win_pct": float(wins.mean()) if len(wins) else np.nan,
+               "average_loss_pct": float(losses.mean()) if len(losses) else np.nan}
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["market_regime", "symbol"]).reset_index(drop=True)
+
 
 def audit_history_coverage(symbols: list[str], horizons: list[str] | None = None) -> pd.DataFrame:
     """Report actual historical coverage and warmup-eligible bars per symbol/horizon."""
