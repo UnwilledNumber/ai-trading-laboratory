@@ -93,3 +93,10 @@ Adds rolling chronological validation for Swing LONG and Swing SHORT. For each f
 Each fold starts a fresh portfolio with the configured starting capital; fold returns are not compounded into one continuous account. The rolling test windows can overlap when the advance is shorter than the test window. Day trading is exposed in the selector but intentionally blocked because the current Yahoo intraday history is only a few recent trading days and cannot support multi-month validation. A longer-history intraday provider is required before day-trading walk-forward results can be meaningful.
 
 This is research tooling, not live execution or proof of profitability. The 27-configuration grid is still a limited search, and repeated model development can contaminate later periods viewed by the researcher. Small samples, survivorship bias, market impact, short borrow availability/costs, taxes, and continuous intrabar mark-to-market are not fully modeled.
+
+
+## Stage 3.9 — Signal quality and feature research
+
+Adds a descriptive feature-analysis panel for one selected strategy at a time. It reruns historical candidate trades with a zero minimum score threshold (while retaining the scanner's underlying eligibility rules), applies the latest-known SPY market regime as of each signal date, and groups outcomes by signal-score bucket, RSI(14) bucket, relative-volume bucket, SPY market regime, ticker, signal type, and exit reason. Groups below the user-selected minimum sample count are omitted. Reports include trade count, win rate, profit factor, mean/median return, and average win/loss, with CSV downloads for the grouped report and underlying candidate trades.
+
+The diagnostic run uses a fixed 1.5 ATR stop and 2.0R target and does not reuse or automatically adopt Stage 3.7/3.8 selected parameters. Findings are descriptive associations, not causal evidence or predictive filters. Any proposed filter must be evaluated on later untouched periods using walk-forward validation. Yahoo intraday history remains too short for robust multi-regime day-trading research. This stage does not modify live scanner signals or execute orders.

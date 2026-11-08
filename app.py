@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples, apply_market_regimes, summarize_by_regime, optimize_strategy_parameters, run_walk_forward_validation)
+from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples, apply_market_regimes, summarize_by_regime, optimize_strategy_parameters, run_walk_forward_validation, analyze_signal_features)
 
 from scanner import (
     fetch_universe, scan_market, load_watchlist, save_watchlist,
@@ -590,3 +590,104 @@ if st.button("Save watchlist"):
     save_watchlist(watchlist)
     st.success(f"Saved {len(watchlist)} tickers.")
 st.caption("Research scanner only. It does not connect to Robinhood, route orders, confirm borrow availability, or guarantee real-time quotes.")
+
+
+st.divider()
+st.header("Stage 3.9 — Signal quality & feature research")
+st.caption(
+    "Studies which observed signal characteristics coincide with stronger or weaker historical trade outcomes. "
+    "These are descriptive associations, not proof that a feature causes returns or will predict future performance."
+)
+with st.expander("Stage 3.9 research settings", expanded=True):
+    f_strategy = st.selectbox(
+        "Strategy to analyze",
+        ["Swing LONG", "Swing SHORT", "Swing BOTH", "Day trading LONG", "Day trading SHORT", "Day trading BOTH"],
+        index=0, key="feature_strategy",
+    )
+    f_min_group = st.selectbox(
+        "Minimum trades required per feature group", [3, 5, 10, 15, 20],
+        index=1, key="feature_min_group",
+    )
+    f_run = st.button("Run Stage 3.9 signal quality research", type="primary", key="feature_run")
+
+if f_run:
+    if f_strategy.startswith("Day trading "):
+        f_horizon = "Day trading"
+        f_direction = f_strategy.replace("Day trading ", "", 1)
+    else:
+        f_horizon, f_direction = f_strategy.split(" ", 1)
+    if f_direction == "BOTH":
+        f_direction = "Both"
+    f_symbols = [x.strip().upper() for x in bt_symbols_text.split(",") if x.strip()]
+    if not f_symbols:
+        st.error("Enter ticker symbols in the Historical Backtesting settings first.")
+    elif f_horizon == "Day trading":
+        st.warning(
+            "Intraday history is currently too short for reliable feature research across market conditions. "
+            "The report can be generated for available data, but treat it as exploratory only."
+        )
+    try:
+        if f_symbols:
+            with st.spinner("Collecting historical trades and measuring signal features…"):
+                f_trades = run_backtest(
+                    symbols=f_symbols, horizon=f_horizon, direction=f_direction,
+                    min_score=0, min_price=2.0, min_dollar_volume=5_000_000,
+                    stop_atr=1.5, target_r=2.0,
+                    slippage_bps=float(bt_slippage), fee_bps_per_side=float(bt_fees),
+                )
+                f_trades = apply_market_regimes(f_trades)
+                f_report, f_ticker = analyze_signal_features(
+                    f_trades, min_group_trades=int(f_min_group)
+                )
+            st.session_state["feature_trades"] = f_trades
+            st.session_state["feature_report"] = f_report
+            st.session_state["feature_ticker"] = f_ticker
+            st.session_state["feature_strategy_label"] = f_strategy
+    except Exception as exc:
+        st.error(f"Signal feature research failed: {exc}")
+        st.exception(exc)
+
+if "feature_report" in st.session_state:
+    f_report = st.session_state["feature_report"]
+    f_ticker = st.session_state.get("feature_ticker", pd.DataFrame())
+    f_trades = st.session_state.get("feature_trades", pd.DataFrame())
+    st.markdown(f"**Latest research: {st.session_state.get('feature_strategy_label', '')}**")
+    if f_trades.empty:
+        st.warning("No candidate trades were generated for these symbols and settings.")
+    else:
+        st.metric("Historical candidate trades analyzed", len(f_trades))
+        st.caption(
+            "The research reruns the selected strategy with a zero minimum score to expose score buckets. "
+            "It uses a fixed 1.5 ATR stop and 2.0R target for this diagnostic run; these are not optimized settings."
+        )
+    if f_report.empty:
+        st.info("No feature groups met the minimum trade-count requirement.")
+    else:
+        st.markdown("**Performance by signal feature**")
+        st.dataframe(f_report.round(3), use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download feature research report (CSV)",
+            f_report.to_csv(index=False).encode("utf-8"),
+            "stage3_9_feature_research.csv", "text/csv", use_container_width=True
+        )
+    if not f_ticker.empty:
+        st.markdown("**Ticker-level feature results**")
+        st.dataframe(f_ticker.round(3), use_container_width=True, hide_index=True)
+    if not f_trades.empty:
+        st.markdown("**Underlying candidate-trade dataset**")
+        st.dataframe(
+            f_trades[[c for c in ["symbol","signal_time","direction","signal","signal_score","rsi","rvol",
+                                   "market_regime","exit_reason","net_return_pct"] if c in f_trades]].round(3),
+            use_container_width=True, hide_index=True
+        )
+        st.download_button(
+            "Download underlying feature dataset (CSV)",
+            f_trades.to_csv(index=False).encode("utf-8"),
+            "stage3_9_candidate_trades.csv", "text/csv", use_container_width=True
+        )
+    st.caption(
+        "Important limitations: groups are descriptive and may have small samples; overlapping signals, "
+        "ticker selection, market-regime classification, and fixed exit assumptions affect results. "
+        "Feature buckets must be evaluated on later untouched periods before being used as filters. "
+        "This stage does not alter scanner signals, choose a live strategy, or execute orders."
+    )

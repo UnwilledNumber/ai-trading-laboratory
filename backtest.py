@@ -1088,3 +1088,58 @@ def run_walk_forward_validation(
     else:
         aggregate = pd.DataFrame()
     return fold_report, aggregate, selected_test
+
+
+def analyze_signal_features(trades: pd.DataFrame, min_group_trades: int = 5) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Describe historical trade outcomes by signal features; association only, not causation."""
+    columns = ["feature", "bucket", "trades", "win_rate_pct", "profit_factor",
+               "mean_trade_pct", "median_trade_pct", "average_win_pct", "average_loss_pct"]
+    if trades is None or trades.empty or "net_return_pct" not in trades.columns:
+        return pd.DataFrame(columns=columns), pd.DataFrame()
+    data = trades.copy()
+    data["net_return_pct"] = pd.to_numeric(data["net_return_pct"], errors="coerce")
+    data = data.dropna(subset=["net_return_pct"])
+
+    def _bucket_numeric(series, bins, labels):
+        values = pd.to_numeric(series, errors="coerce")
+        return pd.cut(values, bins=bins, labels=labels, include_lowest=True).astype("object").where(values.notna(), "Unavailable")
+
+    feature_specs = []
+    if "signal_score" in data:
+        data["_score_bucket"] = _bucket_numeric(data["signal_score"], [-np.inf, 49, 59, 69, 79, np.inf],
+                                                 ["0-49", "50-59", "60-69", "70-79", "80+"])
+        feature_specs.append(("Signal score", "_score_bucket"))
+    if "rsi" in data:
+        data["_rsi_bucket"] = _bucket_numeric(data["rsi"], [-np.inf, 30, 45, 55, 70, np.inf],
+                                               ["<=30", "30-45", "45-55", "55-70", ">70"])
+        feature_specs.append(("RSI(14)", "_rsi_bucket"))
+    if "rvol" in data:
+        data["_rvol_bucket"] = _bucket_numeric(data["rvol"], [-np.inf, 0.8, 1.2, 2.0, np.inf],
+                                                ["<0.8x", "0.8-1.2x", "1.2-2.0x", ">2.0x"])
+        feature_specs.append(("Relative volume", "_rvol_bucket"))
+    for col, label in [("market_regime", "SPY market regime"), ("symbol", "Ticker"),
+                       ("signal", "Signal type"), ("exit_reason", "Exit reason")]:
+        if col in data:
+            data[col] = data[col].fillna("Unavailable").astype(str)
+            feature_specs.append((label, col))
+
+    rows = []
+    for label, col in feature_specs:
+        for bucket, group in data.groupby(col, dropna=False, observed=False):
+            returns = group["net_return_pct"].dropna()
+            if len(returns) < int(min_group_trades):
+                continue
+            wins, losses = returns[returns > 0], returns[returns < 0]
+            gross_profit, gross_loss = float(wins.sum()), float(abs(losses.sum()))
+            pf = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+            rows.append({
+                "feature": label, "bucket": str(bucket), "trades": int(len(returns)),
+                "win_rate_pct": float((returns > 0).mean() * 100),
+                "profit_factor": float(pf), "mean_trade_pct": float(returns.mean()),
+                "median_trade_pct": float(returns.median()),
+                "average_win_pct": float(wins.mean()) if len(wins) else np.nan,
+                "average_loss_pct": float(losses.mean()) if len(losses) else np.nan,
+            })
+    report = pd.DataFrame(rows, columns=columns)
+    ticker = report[report["feature"].eq("Ticker")].copy() if not report.empty else pd.DataFrame(columns=columns)
+    return report, ticker
