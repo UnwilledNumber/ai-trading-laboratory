@@ -211,6 +211,15 @@ def run_backtest(
                     slippage_bps=slippage_bps, fee_bps_per_side=fee_bps_per_side,
                 )
                 if not result.empty:
+                    result = result.copy()
+                    # Daily bars may be timezone-naive while intraday bars carry an
+                    # exchange timezone. Canonicalize before concatenating/sorting.
+                    for time_col in ("signal_time", "entry_time", "exit_time"):
+                        if time_col in result.columns:
+                            result[time_col] = (
+                                pd.to_datetime(result[time_col], errors="coerce", utc=True)
+                                .dt.tz_convert(None)
+                            )
                     frames.append(result)
             except Exception as exc:
                 print(f"Backtest skipped {symbol} ({selected_horizon}): {exc}")
@@ -479,16 +488,31 @@ def summarize_sample_by_strategy(trades: pd.DataFrame, sample_name: str) -> pd.D
     return pd.DataFrame(rows, columns=cols)
 
 def make_walk_forward_split(trades: pd.DataFrame, train_fraction: float = 0.70):
+    """Chronological split using timezone-normalized timestamps.
+
+    Daily and intraday feeds can return naive and timezone-aware timestamps.
+    Normalize both to UTC-naive before sorting/comparison to avoid pandas
+    mixed-timezone TypeErrors.
+    """
     if trades.empty:
         return pd.DataFrame(), pd.DataFrame()
-    ordered = trades.sort_values("entry_time").copy()
-    unique_dates = sorted(pd.to_datetime(ordered["entry_time"]).unique())
+    ordered = trades.copy()
+    normalized_entry = pd.to_datetime(ordered["entry_time"], errors="coerce", utc=True).dt.tz_convert(None)
+    valid = normalized_entry.notna()
+    ordered = ordered.loc[valid].copy()
+    normalized_entry = normalized_entry.loc[valid]
+    if ordered.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    ordered["_normalized_entry_time"] = normalized_entry
+    ordered = ordered.sort_values("_normalized_entry_time", kind="mergesort")
+    unique_dates = ordered["_normalized_entry_time"].drop_duplicates().sort_values().to_numpy()
     if len(unique_dates) < 3:
-        return ordered, pd.DataFrame()
+        return ordered.drop(columns=["_normalized_entry_time"]), pd.DataFrame()
     split_index = max(1, min(len(unique_dates)-1, int(len(unique_dates)*train_fraction)))
     cutoff = unique_dates[split_index]
-    return ordered[pd.to_datetime(ordered["entry_time"]) < cutoff].copy(), ordered[
-        pd.to_datetime(ordered["entry_time"]) >= cutoff].copy()
+    train = ordered[ordered["_normalized_entry_time"] < cutoff].drop(columns=["_normalized_entry_time"]).copy()
+    test = ordered[ordered["_normalized_entry_time"] >= cutoff].drop(columns=["_normalized_entry_time"]).copy()
+    return train, test
 
 
 def summarize_trades(trades: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
