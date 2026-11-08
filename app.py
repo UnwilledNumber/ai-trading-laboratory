@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics)
+from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples)
 
 from scanner import (
     fetch_universe, scan_market, load_watchlist, save_watchlist,
@@ -167,7 +167,7 @@ if run_bt:
     if not bt_symbols:
         st.error("Enter at least one ticker symbol.")
     else:
-        with st.spinner("Downloading historical bars and simulating trades. Intraday history is requested over the provider's maximum approximately 60-day window."):
+        with st.spinner("Downloading historical bars and simulating trades. Intraday history is limited to approximately five trading days by the current provider."):
             normalized_horizon = (
                 "Both" if bt_horizon == "Both (daily + intraday)" else bt_horizon
             )
@@ -215,8 +215,8 @@ if "bt_trades" in st.session_state:
     coverage = st.session_state.get("bt_coverage", pd.DataFrame())
     if not coverage.empty:
         st.dataframe(coverage, use_container_width=True, hide_index=True)
-        if (coverage["coverage_status"] == "EXTENDED, STILL LIMITED").any():
-            st.warning("Intraday history has been extended to the provider's approximate 60-day limit. This improves session coverage, but it is still not multi-year or multi-regime evidence. Treat day-trading results as preliminary.")
+        if (coverage["coverage_status"] == "LIMITED HISTORY").any():
+            st.warning("Intraday results use a very short provider history window. Treat day-trading statistics as preliminary, not robust out-of-sample evidence.")
     if bt_trades.empty or allocated.empty or not bt_summary:
         st.warning("No portfolio trades were generated. The coverage audit above still shows whether usable historical bars were available.")
     else:
@@ -276,6 +276,43 @@ if "bt_trades" in st.session_state:
             st.caption("Do not tune parameters against the out-of-sample portion and then treat it as independent.")
         else:
             st.info("No strategy has at least three distinct trading sessions available for a chronological split. The coverage audit explains the data limitation.")
+
+
+        st.subheader("Stage 3.5 — Individual ticker diagnostics")
+        st.caption("Select one strategy to identify which symbols contributed to gains or losses. Signal-return metrics use raw candidates; portfolio P&L includes only trades accepted by the portfolio constraints.")
+        strategy_options = [
+            "Swing LONG", "Swing SHORT", "Day trading LONG", "Day trading SHORT"
+        ]
+        selected_ticker_strategy = st.selectbox(
+            "Strategy to diagnose", strategy_options, index=0, key="ticker_diagnostic_strategy"
+        )
+        selected_horizon, selected_direction = selected_ticker_strategy.rsplit(" ", 1)
+        ticker_subset = bt_trades[
+            (bt_trades["horizon"].astype(str).str.lower() == selected_horizon.lower()) &
+            (bt_trades["direction"].astype(str).str.upper() == selected_direction)
+        ].copy()
+        allocated_subset = allocated[
+            (allocated["horizon"].astype(str).str.lower() == selected_horizon.lower()) &
+            (allocated["direction"].astype(str).str.upper() == selected_direction)
+        ].copy() if not allocated.empty else pd.DataFrame()
+        if ticker_subset.empty:
+            st.info("No candidate trades exist for this strategy in the selected backtest.")
+        else:
+            ticker_report = summarize_by_ticker(ticker_subset, allocated_subset)
+            st.dataframe(ticker_report.round(3), use_container_width=True, hide_index=True)
+            st.caption("Profit factor is gross winning trade returns divided by absolute gross losing trade returns. Compounded trade return assumes sequential reinvestment of each trade return per ticker; it is a diagnostic statistic, not portfolio performance.")
+            selected_train, selected_test = make_walk_forward_split(ticker_subset)
+            ticker_sample_report = summarize_ticker_samples(selected_train, selected_test)
+            st.markdown("**Ticker-by-ticker in-sample versus out-of-sample**")
+            if not ticker_sample_report.empty:
+                st.dataframe(ticker_sample_report.round(3), use_container_width=True, hide_index=True)
+            else:
+                st.info("Insufficient distinct sessions to create an independent ticker-level split.")
+            st.download_button(
+                "Download ticker diagnostics (CSV)",
+                ticker_report.to_csv(index=False).encode("utf-8"),
+                "ticker_diagnostics.csv", "text/csv", use_container_width=True
+            )
 
         st.write("**Trade log (portfolio allocations)**")
         display_cols = ["symbol","horizon","direction","signal_time","entry_time","exit_time",

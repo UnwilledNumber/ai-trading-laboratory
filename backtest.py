@@ -15,13 +15,9 @@ def _download_history(symbol: str, horizon: str) -> pd.DataFrame:
                           progress=False, threads=False)
         intraday = False
     else:
-        # Yahoo Finance limits intraday history to roughly the most recent 60
-        # calendar days. Request the longest supported window for a more useful
-        # session-level research sample than the previous 5-day prototype.
-        end_date = (pd.Timestamp.now(tz="America/New_York").normalize() + pd.Timedelta(days=1)).date()
-        start_date = end_date - pd.Timedelta(days=59)
-        raw = yf.download(symbol, start=start_date.isoformat(), end=end_date.isoformat(),
-                          interval="5m", auto_adjust=True, progress=False, threads=False)
+        # Yahoo Finance generally limits 5-minute history to approximately 5 trading days.
+        raw = yf.download(symbol, period="5d", interval="5m", auto_adjust=True,
+                          progress=False, threads=False)
         intraday = True
     if raw is None or raw.empty:
         return pd.DataFrame()
@@ -43,7 +39,7 @@ def audit_history_coverage(symbols: list[str], horizons: list[str] | None = None
     for horizon in horizons:
         intraday = str(horizon).strip().lower() in {"day trading", "intraday", "day-trading"}
         interval = "5m" if intraday else "1d"
-        requested_period = "~60 calendar days (provider intraday limit)" if intraday else "5y"
+        requested_period = "5d" if intraday else "5y"
         warmup = 35 if intraday else 210
         for symbol in unique_symbols:
             try:
@@ -60,10 +56,8 @@ def audit_history_coverage(symbols: list[str], horizons: list[str] | None = None
                     status = "INSUFFICIENT BARS"
                     note = f"{count} bars; {warmup} required for indicator warmup."
                 elif intraday:
-                    status = "EXTENDED, STILL LIMITED"
-                    note = (f"Loaded {sessions} sessions where available. Yahoo 5-minute history is limited "
-                            "to approximately 60 calendar days; this is a larger sample, but not multi-year "
-                            "or multi-regime validation.")
+                    status = "LIMITED HISTORY"
+                    note = "Yahoo 5-minute feed is requested at 5d; too short for robust multi-regime validation."
                 else:
                     status = "USABLE"
                     note = "Daily history available for swing research; check start/end dates for gaps."
@@ -573,6 +567,100 @@ def strategy_split_diagnostics(trades: pd.DataFrame, train_fraction: float = 0.7
                      "split_cutoff_session": cutoff, "validation_status": status})
     return pd.DataFrame(rows)
 
+
+
+def summarize_by_ticker(
+    trades: pd.DataFrame,
+    allocated_trades: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Ticker-level signal diagnostics plus realized portfolio contribution.
+
+    Trade-return statistics use raw candidate trades, before portfolio constraints.
+    Portfolio P&L uses only rows marked TAKEN in allocated_trades.
+    """
+    columns = [
+        "symbol", "candidate_trades", "win_rate_pct", "profit_factor",
+        "mean_trade_pct", "compounded_trade_return_pct",
+        "average_win_pct", "average_loss_pct", "gross_profit_pct",
+        "gross_loss_pct", "taken_trades", "portfolio_pnl",
+    ]
+    if trades.empty:
+        return pd.DataFrame(columns=columns)
+
+    taken_by_symbol = {}
+    if allocated_trades is not None and not allocated_trades.empty:
+        if {"symbol", "portfolio_status", "portfolio_pnl"}.issubset(allocated_trades.columns):
+            accepted = allocated_trades[allocated_trades["portfolio_status"] == "TAKEN"]
+            for symbol, group in accepted.groupby(accepted["symbol"].astype(str).str.upper()):
+                taken_by_symbol[symbol] = {
+                    "taken_trades": int(len(group)),
+                    "portfolio_pnl": float(pd.to_numeric(group["portfolio_pnl"], errors="coerce").fillna(0).sum()),
+                }
+
+    rows = []
+    for symbol, group in trades.groupby(trades["symbol"].astype(str).str.upper()):
+        returns = pd.to_numeric(group["net_return_pct"], errors="coerce").dropna()
+        wins, losses = returns[returns > 0], returns[returns < 0]
+        gross_profit = float(wins.sum())
+        gross_loss = float(abs(losses.sum()))
+        profit_factor = (
+            gross_profit / gross_loss if gross_loss > 0
+            else (float("inf") if gross_profit > 0 else 0.0)
+        )
+        compounded = float(((1 + returns / 100).prod() - 1) * 100) if len(returns) else 0.0
+        portfolio = taken_by_symbol.get(symbol, {"taken_trades": 0, "portfolio_pnl": 0.0})
+        rows.append({
+            "symbol": symbol,
+            "candidate_trades": int(len(returns)),
+            "win_rate_pct": float((returns > 0).mean() * 100) if len(returns) else np.nan,
+            "profit_factor": float(profit_factor),
+            "mean_trade_pct": float(returns.mean()) if len(returns) else np.nan,
+            "compounded_trade_return_pct": compounded,
+            "average_win_pct": float(wins.mean()) if len(wins) else np.nan,
+            "average_loss_pct": float(losses.mean()) if len(losses) else np.nan,
+            "gross_profit_pct": gross_profit,
+            "gross_loss_pct": gross_loss,
+            "taken_trades": int(portfolio["taken_trades"]),
+            "portfolio_pnl": float(portfolio["portfolio_pnl"]),
+        })
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["portfolio_pnl", "mean_trade_pct"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+
+def summarize_ticker_samples(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+) -> pd.DataFrame:
+    """Per-ticker in-sample and out-of-sample diagnostics for a chosen strategy."""
+    columns = [
+        "symbol", "sample", "trades", "win_rate_pct", "profit_factor",
+        "mean_trade_pct", "average_win_pct", "average_loss_pct",
+        "compounded_trade_return_pct",
+    ]
+    rows = []
+    for sample_name, frame in (("In-sample", train), ("Out-of-sample", test)):
+        if frame.empty:
+            continue
+        for symbol, group in frame.groupby(frame["symbol"].astype(str).str.upper()):
+            returns = pd.to_numeric(group["net_return_pct"], errors="coerce").dropna()
+            if returns.empty:
+                continue
+            wins, losses = returns[returns > 0], returns[returns < 0]
+            gp, gl = float(wins.sum()), float(abs(losses.sum()))
+            pf = gp / gl if gl > 0 else (float("inf") if gp > 0 else 0.0)
+            rows.append({
+                "symbol": symbol,
+                "sample": sample_name,
+                "trades": int(len(returns)),
+                "win_rate_pct": float((returns > 0).mean() * 100),
+                "profit_factor": float(pf),
+                "mean_trade_pct": float(returns.mean()),
+                "average_win_pct": float(wins.mean()) if len(wins) else np.nan,
+                "average_loss_pct": float(losses.mean()) if len(losses) else np.nan,
+                "compounded_trade_return_pct": float(((1 + returns / 100).prod() - 1) * 100),
+            })
+    return pd.DataFrame(rows, columns=columns)
 
 def make_walk_forward_split(trades: pd.DataFrame, train_fraction: float = 0.70):
     """Split each strategy independently by whole trading sessions, not mixed horizons."""
