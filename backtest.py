@@ -923,3 +923,168 @@ def optimize_strategy_parameters(
         "eligible_configurations": len(eligible),
     })
     return leaderboard, holdout, best["_train"].copy(), best["_test"].copy()
+
+
+def run_walk_forward_validation(
+    symbols: list[str],
+    horizon: str = "Swing",
+    direction: str = "LONG",
+    score_values: list[int] | None = None,
+    stop_values: list[float] | None = None,
+    target_values: list[float] | None = None,
+    train_months: int = 12,
+    test_months: int = 3,
+    step_months: int = 3,
+    min_train_trades: int = 20,
+    slippage_bps: float = 5.0,
+    fee_bps_per_side: float = 0.0,
+    starting_capital: float = 10_000.0,
+    risk_per_trade_pct: float = 0.5,
+    max_positions: int = 5,
+    max_position_exposure_pct: float = 25.0,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Repeated rolling walk-forward parameter selection and forward evaluation.
+
+    Each fold selects a parameter set using only trades whose exits fall in the
+    preceding training window. The selected set is then evaluated on trades
+    entering in the immediately following test window. No test-window metric is
+    used to choose parameters. Returns fold report, aggregate summary and
+    concatenated selected test trades (including portfolio allocation fields).
+    """
+    score_values = score_values or [50, 60, 70]
+    stop_values = stop_values or [1.0, 1.5, 2.0]
+    target_values = target_values or [1.5, 2.0, 3.0]
+    configs = []
+    for score in score_values:
+        for stop in stop_values:
+            for target in target_values:
+                candidate = run_backtest(
+                    symbols=symbols, horizon=horizon, direction=direction,
+                    min_score=int(score), min_price=2.0,
+                    min_dollar_volume=5_000_000, stop_atr=float(stop),
+                    target_r=float(target), slippage_bps=float(slippage_bps),
+                    fee_bps_per_side=float(fee_bps_per_side),
+                )
+                if not candidate.empty:
+                    for col in ("signal_time", "entry_time", "exit_time"):
+                        candidate[col] = pd.to_datetime(candidate[col], errors="coerce", utc=True).dt.tz_convert(None)
+                    configs.append({
+                        "min_score": int(score), "stop_atr": float(stop),
+                        "target_r": float(target), "trades": candidate,
+                    })
+    if not configs:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    valid_dates = pd.concat([
+        pd.to_datetime(c["trades"]["entry_time"], errors="coerce") for c in configs
+    ]).dropna()
+    if valid_dates.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    first_date, last_date = valid_dates.min().normalize(), valid_dates.max().normalize()
+    test_start = first_date + pd.DateOffset(months=int(train_months))
+    folds, all_test_trades = [], []
+    fold_number = 0
+    while test_start <= last_date:
+        test_end = test_start + pd.DateOffset(months=int(test_months))
+        train_start = test_start - pd.DateOffset(months=int(train_months))
+        ranked = []
+        for config in configs:
+            trades = config["trades"]
+            train = trades[
+                (pd.to_datetime(trades["exit_time"]) >= train_start) &
+                (pd.to_datetime(trades["exit_time"]) < test_start)
+            ]
+            metrics = _optimization_metrics(train)
+            if metrics["trades"] >= int(min_train_trades) and np.isfinite(metrics["profit_factor"]):
+                ranked.append((metrics["profit_factor"], metrics["mean_trade_pct"],
+                               config, metrics))
+        fold_number += 1
+        if not ranked:
+            folds.append({
+                "fold": fold_number, "train_start": train_start.date(),
+                "train_end": (test_start - pd.Timedelta(days=1)).date(),
+                "test_start": test_start.date(),
+                "test_end": (test_end - pd.Timedelta(days=1)).date(),
+                "status": "NO ELIGIBLE TRAINING CONFIGURATION",
+                "selected_min_score": np.nan, "selected_stop_atr": np.nan,
+                "selected_target_r": np.nan, "train_trades": 0,
+                "train_profit_factor": np.nan, "test_trades": 0,
+                "test_profit_factor": np.nan, "test_mean_trade_pct": np.nan,
+                "test_win_rate_pct": np.nan, "test_compounded_return_pct": np.nan,
+                "test_max_drawdown_pct": np.nan, "portfolio_trades": 0,
+                "portfolio_return_pct": np.nan, "portfolio_max_drawdown_pct": np.nan,
+            })
+            test_start += pd.DateOffset(months=int(step_months))
+            continue
+
+        ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        _, _, selected, train_metrics = ranked[0]
+        selected_trades = selected["trades"]
+        test = selected_trades[
+            (pd.to_datetime(selected_trades["entry_time"]) >= test_start) &
+            (pd.to_datetime(selected_trades["entry_time"]) < test_end)
+        ].copy()
+        test_metrics = _optimization_metrics(test)
+        allocated, equity_curve = simulate_portfolio(
+            test, starting_capital=float(starting_capital),
+            risk_per_trade_pct=float(risk_per_trade_pct),
+            max_positions=int(max_positions),
+            max_position_exposure_pct=float(max_position_exposure_pct),
+        )
+        taken = allocated[allocated.get("portfolio_status", pd.Series(index=allocated.index, dtype=str)).eq("TAKEN")].copy() if not allocated.empty else pd.DataFrame()
+        if not taken.empty:
+            end_equity = float(starting_capital) + float(taken["portfolio_pnl"].sum())
+            portfolio_return = (end_equity / float(starting_capital) - 1) * 100
+            portfolio_dd = float(equity_curve["drawdown_pct"].min()) if not equity_curve.empty else 0.0
+            taken["walk_forward_fold"] = fold_number
+            taken["selected_min_score"] = selected["min_score"]
+            taken["selected_stop_atr"] = selected["stop_atr"]
+            taken["selected_target_r"] = selected["target_r"]
+            all_test_trades.append(taken)
+        else:
+            end_equity, portfolio_return, portfolio_dd = float(starting_capital), 0.0, 0.0
+        folds.append({
+            "fold": fold_number, "train_start": train_start.date(),
+            "train_end": (test_start - pd.Timedelta(days=1)).date(),
+            "test_start": test_start.date(),
+            "test_end": (test_end - pd.Timedelta(days=1)).date(),
+            "status": "EVALUATED" if not test.empty else "NO TEST TRADES",
+            "selected_min_score": selected["min_score"],
+            "selected_stop_atr": selected["stop_atr"],
+            "selected_target_r": selected["target_r"],
+            "train_trades": train_metrics["trades"],
+            "train_profit_factor": train_metrics["profit_factor"],
+            "test_trades": test_metrics["trades"],
+            "test_profit_factor": test_metrics["profit_factor"],
+            "test_mean_trade_pct": test_metrics["mean_trade_pct"],
+            "test_win_rate_pct": test_metrics["win_rate_pct"],
+            "test_compounded_return_pct": test_metrics["compounded_return_pct"],
+            "test_max_drawdown_pct": test_metrics["max_drawdown_pct"],
+            "portfolio_trades": int(len(taken)),
+            "portfolio_return_pct": portfolio_return,
+            "portfolio_max_drawdown_pct": portfolio_dd,
+        })
+        test_start += pd.DateOffset(months=int(step_months))
+
+    fold_report = pd.DataFrame(folds)
+    selected_test = pd.concat(all_test_trades, ignore_index=True) if all_test_trades else pd.DataFrame()
+    evaluated = fold_report[fold_report["status"].isin(["EVALUATED", "NO TEST TRADES"])] if not fold_report.empty else pd.DataFrame()
+    if not evaluated.empty:
+        valid_pf = pd.to_numeric(evaluated["test_profit_factor"], errors="coerce").dropna()
+        valid_mean = pd.to_numeric(evaluated["test_mean_trade_pct"], errors="coerce").dropna()
+        valid_port = pd.to_numeric(evaluated["portfolio_return_pct"], errors="coerce").dropna()
+        aggregate = pd.DataFrame([{
+            "folds_total": int(len(fold_report)),
+            "folds_with_test_trades": int((evaluated["test_trades"] > 0).sum()),
+            "positive_test_folds": int((pd.to_numeric(evaluated["test_mean_trade_pct"], errors="coerce") > 0).sum()),
+            "median_test_profit_factor": float(valid_pf.median()) if len(valid_pf) else np.nan,
+            "average_test_mean_trade_pct": float(valid_mean.mean()) if len(valid_mean) else np.nan,
+            "combined_portfolio_trades": int(evaluated["portfolio_trades"].sum()),
+            "sum_of_fold_portfolio_returns_pct": float(valid_port.sum()) if len(valid_port) else np.nan,
+            "median_fold_portfolio_return_pct": float(valid_port.median()) if len(valid_port) else np.nan,
+            "worst_fold_portfolio_drawdown_pct": float(pd.to_numeric(evaluated["portfolio_max_drawdown_pct"], errors="coerce").min()),
+            "configurations_tested_per_fold": int(len(score_values) * len(stop_values) * len(target_values)),
+        }])
+    else:
+        aggregate = pd.DataFrame()
+    return fold_report, aggregate, selected_test

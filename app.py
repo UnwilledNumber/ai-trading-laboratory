@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples, apply_market_regimes, summarize_by_regime, optimize_strategy_parameters)
+from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples, apply_market_regimes, summarize_by_regime, optimize_strategy_parameters, run_walk_forward_validation)
 
 from scanner import (
     fetch_universe, scan_market, load_watchlist, save_watchlist,
@@ -445,6 +445,122 @@ if "bt_trades" in st.session_state:
                 )
             else:
                 st.warning(opt_holdout.get("status", "No configuration passed the minimum training sample rule."))
+
+
+        st.subheader("Stage 3.8 — Walk-forward validation")
+        st.caption(
+            "Repeatedly selects parameters using only the preceding training window, then evaluates "
+            "the selected configuration on the next forward test window. Each fold starts a separate "
+            "portfolio simulation; fold returns are not compounded into one continuous account."
+        )
+        with st.expander("Stage 3.8 validation settings", expanded=False):
+            wf_strategy = st.selectbox(
+                "Strategy to validate",
+                ["Swing LONG", "Swing SHORT", "Day trading LONG", "Day trading SHORT"],
+                key="wf_strategy",
+            )
+            wf_horizon, wf_direction = wf_strategy.rsplit(" ", 1)
+            wf_train_months = st.selectbox(
+                "Training window (months)", [6, 9, 12, 18, 24],
+                index=2, key="wf_train_months"
+            )
+            wf_test_months = st.selectbox(
+                "Forward test window (months)", [1, 2, 3, 6],
+                index=2, key="wf_test_months"
+            )
+            wf_step_months = st.selectbox(
+                "Advance between folds (months)", [1, 2, 3, 6],
+                index=2, key="wf_step_months"
+            )
+            wf_min_trades = st.selectbox(
+                "Minimum training trades per configuration", [10, 20, 30, 40],
+                index=1, key="wf_min_trades"
+            )
+            wf_run = st.button(
+                "Run Stage 3.8 walk-forward validation", type="primary", key="wf_run"
+            )
+        if wf_run:
+            wf_symbols = [s.strip().upper() for s in bt_symbols_text.split(",") if s.strip()]
+            if not wf_symbols:
+                st.error("Enter ticker symbols in the backtest settings before running validation.")
+            elif wf_step_months > wf_test_months:
+                st.error("Advance between folds cannot exceed the forward test window; otherwise gaps appear.")
+            elif wf_horizon == "Day trading":
+                st.warning(
+                    "The current Yahoo Finance intraday source provides only a few recent trading days. "
+                    "It cannot support multi-month walk-forward validation. Run Swing strategies for now; "
+                    "a longer-history intraday data provider is required for valid Day trading folds."
+                )
+            else:
+                try:
+                    with st.spinner("Running 27 parameter configurations across rolling historical windows. This can take several minutes…"):
+                        wf_folds, wf_summary, wf_selected = run_walk_forward_validation(
+                            symbols=wf_symbols, horizon=wf_horizon, direction=wf_direction,
+                            score_values=[50, 60, 70], stop_values=[1.0, 1.5, 2.0],
+                            target_values=[1.5, 2.0, 3.0],
+                            train_months=int(wf_train_months),
+                            test_months=int(wf_test_months),
+                            step_months=int(wf_step_months),
+                            min_train_trades=int(wf_min_trades),
+                            slippage_bps=float(bt_slippage),
+                            fee_bps_per_side=float(bt_fees),
+                            starting_capital=float(bt_capital),
+                            risk_per_trade_pct=float(bt_risk),
+                            max_positions=int(bt_max_positions),
+                            max_position_exposure_pct=float(bt_position_cap),
+                        )
+                    st.session_state["wf_folds"] = wf_folds
+                    st.session_state["wf_summary"] = wf_summary
+                    st.session_state["wf_selected"] = wf_selected
+                    st.session_state["wf_strategy_label"] = wf_strategy
+                except Exception as exc:
+                    st.error(f"Walk-forward validation failed: {exc}")
+                    st.exception(exc)
+
+        if "wf_folds" in st.session_state:
+            wf_folds = st.session_state["wf_folds"]
+            wf_summary = st.session_state.get("wf_summary", pd.DataFrame())
+            st.markdown(f"**Latest validation: {st.session_state.get('wf_strategy_label', '')}**")
+            if wf_folds.empty:
+                st.warning(
+                    "No walk-forward folds could be formed from the available historical data. "
+                    "The selected training window may be too long for the provider's history."
+                )
+            else:
+                st.markdown("**Fold-by-fold results**")
+                st.dataframe(wf_folds.round(3), use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download walk-forward fold results (CSV)",
+                    wf_folds.to_csv(index=False).encode("utf-8"),
+                    "stage3_8_walk_forward_folds.csv", "text/csv", use_container_width=True
+                )
+            if not wf_summary.empty:
+                st.markdown("**Aggregate consistency summary**")
+                st.dataframe(wf_summary.round(3), use_container_width=True, hide_index=True)
+            wf_selected = st.session_state.get("wf_selected", pd.DataFrame())
+            if not wf_selected.empty:
+                st.markdown("**Forward-test portfolio trades**")
+                wf_taken = wf_selected[wf_selected["portfolio_status"].eq("TAKEN")].copy()
+                st.dataframe(
+                    wf_taken[[c for c in [
+                        "walk_forward_fold", "symbol", "entry_time", "exit_time",
+                        "selected_min_score", "selected_stop_atr", "selected_target_r",
+                        "net_return_pct", "portfolio_pnl"
+                    ] if c in wf_taken.columns]].round(3),
+                    use_container_width=True, hide_index=True
+                )
+                st.download_button(
+                    "Download forward-test portfolio trades (CSV)",
+                    wf_selected.to_csv(index=False).encode("utf-8"),
+                    "stage3_8_forward_test_trades.csv", "text/csv", use_container_width=True
+                )
+            st.caption(
+                "Each fold chooses parameters only from its prior training window. Test results are not "
+                "used to rank that fold's configuration. The current engine uses overlapping rolling "
+                "windows and resets starting capital for each fold; summed fold returns are descriptive, "
+                "not a continuous compounded account curve. Small samples, provider history limits, "
+                "survivorship bias, market impact, borrow costs and taxes remain limitations."
+            )
 
         st.write("**Trade log (portfolio allocations)**")
         display_cols = ["symbol","horizon","direction","signal_time","entry_time","exit_time",
