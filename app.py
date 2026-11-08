@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples, apply_market_regimes, summarize_by_regime, optimize_strategy_parameters, run_walk_forward_validation, analyze_signal_features)
+from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples, apply_market_regimes, summarize_by_regime, optimize_strategy_parameters, run_walk_forward_validation, analyze_signal_features, run_portfolio_robustness)
 
 from scanner import (
     fetch_universe, scan_market, load_watchlist, save_watchlist,
@@ -690,4 +690,122 @@ if "feature_report" in st.session_state:
         "ticker selection, market-regime classification, and fixed exit assumptions affect results. "
         "Feature buckets must be evaluated on later untouched periods before being used as filters. "
         "This stage does not alter scanner signals, choose a live strategy, or execute orders."
+    )
+
+
+st.divider()
+st.header("Stage 3.10 — Portfolio risk & robustness")
+st.caption(
+    "Combines eligible historical trades into one chronological simulated account, removes duplicate trade records, "
+    "excludes trades that have not fully exited before today's date, and tests sensitivity to additional slippage."
+)
+with st.expander("Stage 3.10 portfolio settings", expanded=True):
+    s_source = st.radio(
+        "Trade dataset",
+        ["Latest Stage 3.9 feature dataset", "Latest historical backtest dataset"],
+        horizontal=False, key="s310_source",
+    )
+    s_capital = st.number_input("Simulation starting capital ($)", min_value=1000.0,
+                                max_value=10000000.0, value=10000.0, step=1000.0,
+                                key="s310_capital")
+    s_risk = st.selectbox("Risk budget per trade (% equity)", [0.25, 0.5, 0.75, 1.0],
+                          index=1, key="s310_risk")
+    s_positions = st.selectbox("Maximum simultaneous positions", [2, 3, 5, 8],
+                               index=2, key="s310_positions")
+    s_position_cap = st.selectbox("Maximum position exposure (% equity)", [10, 15, 20, 25],
+                                  index=3, key="s310_position_cap")
+    s_gross_cap = st.selectbox("Maximum total gross exposure (% equity)", [50, 75, 100, 125],
+                               index=2, key="s310_gross_cap")
+    s_run = st.button("Run Stage 3.10 portfolio robustness", type="primary", key="s310_run")
+
+if s_run:
+    s_data = st.session_state.get("feature_trades", pd.DataFrame()) if s_source.startswith("Latest Stage 3.9") else st.session_state.get("bt_trades", pd.DataFrame())
+    if s_data is None or s_data.empty:
+        st.error("No matching trade dataset is loaded. Run the selected Stage 3.9 feature analysis or a historical backtest first.")
+    else:
+        with st.spinner("Auditing timestamps, simulating the account, and running cost stress tests…"):
+            s_summary, s_alloc, s_curve, s_stress, s_benchmark = run_portfolio_robustness(
+                s_data, starting_capital=float(s_capital),
+                risk_per_trade_pct=float(s_risk), max_positions=int(s_positions),
+                max_position_exposure_pct=float(s_position_cap),
+                max_gross_exposure_pct=float(s_gross_cap),
+            )
+        st.session_state["s310_summary"] = s_summary
+        st.session_state["s310_alloc"] = s_alloc
+        st.session_state["s310_curve"] = s_curve
+        st.session_state["s310_stress"] = s_stress
+        st.session_state["s310_benchmark"] = s_benchmark
+        st.session_state["s310_source_label"] = s_source
+
+if "s310_summary" in st.session_state:
+    s_summary = st.session_state["s310_summary"]
+    s_alloc = st.session_state.get("s310_alloc", pd.DataFrame())
+    s_curve = st.session_state.get("s310_curve", pd.DataFrame())
+    s_stress = st.session_state.get("s310_stress", pd.DataFrame())
+    s_benchmark = st.session_state.get("s310_benchmark", {})
+    st.markdown(f"**Latest Stage 3.10 run:** {st.session_state.get('s310_source_label','')}")
+    if not s_summary.get("accepted_trades", 0):
+        st.warning("No eligible completed trades were accepted. Check that the source contains entry/exit timestamps and valid stop prices.")
+    else:
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("Accepted trades", f"{s_summary['accepted_trades']:,}")
+        m2.metric("Portfolio return", f"{s_summary['portfolio_return_pct']:.2f}%")
+        m3.metric("Profit factor", f"{s_summary['profit_factor']:.2f}")
+        m4.metric("Exit-to-exit max drawdown", f"{s_summary['max_exit_to_exit_drawdown_pct']:.2f}%")
+        st.markdown("**Data integrity audit**")
+        audit = pd.DataFrame([
+            {"Check":"Raw candidate trades","Result":s_summary["raw_trades"]},
+            {"Check":"Completed trades eligible by date","Result":s_summary["completed_trades"]},
+            {"Check":"Excluded incomplete/future trades","Result":s_summary["excluded_incomplete"]},
+            {"Check":"Duplicate records removed","Result":s_summary["duplicates_removed"]},
+            {"Check":"Accepted portfolio trades","Result":s_summary["accepted_trades"]},
+            {"Check":"Skipped by portfolio constraints","Result":s_summary["skipped_trades"]},
+        ])
+        st.dataframe(audit, use_container_width=True, hide_index=True)
+        st.markdown("**Risk diagnostics**")
+        risk_rows = [
+            ("Maximum consecutive losing trades",s_summary["max_consecutive_losses"]),
+            ("Longest underwater period (exit events)",s_summary["longest_underwater_exit_events"]),
+            ("Top-three ticker share of net P&L",s_summary["top3_ticker_pnl_share_pct"]),
+            ("Maximum position weight",s_summary["max_position_weight_pct"]),
+            ("Maximum allocated risk at entry",s_summary["max_allocated_risk_pct_equity"]),
+            ("Ending simulated equity",s_summary["ending_equity"]),
+        ]
+        st.dataframe(pd.DataFrame(risk_rows,columns=["Metric","Value"]),use_container_width=True,hide_index=True)
+        st.markdown("**Equity curve (realized exits)**")
+        if not s_curve.empty:
+            fig_s = go.Figure()
+            fig_s.add_trace(go.Scatter(x=s_curve["time"],y=s_curve["equity"],mode="lines",name="Portfolio equity"))
+            fig_s.update_layout(height=330,margin=dict(l=5,r=5,t=20,b=5),xaxis_title="Exit date",yaxis_title="Equity ($)")
+            st.plotly_chart(fig_s,use_container_width=True)
+            dd = go.Figure()
+            dd.add_trace(go.Scatter(x=s_curve["time"],y=s_curve["drawdown_pct"],mode="lines",name="Drawdown (%)"))
+            dd.update_layout(height=250,margin=dict(l=5,r=5,t=20,b=5),yaxis_title="Drawdown (%)")
+            st.plotly_chart(dd,use_container_width=True)
+        st.markdown("**Additional slippage stress test**")
+        st.dataframe(s_stress.round(3),use_container_width=True,hide_index=True)
+        if s_benchmark.get("spy_buy_hold_return_pct") is not None:
+            st.write(
+                f"SPY buy-and-hold reference over the available daily-price window: "
+                f"**{s_benchmark['spy_buy_hold_return_pct']:.2f}%** "
+                f"({s_benchmark.get('spy_start_date','')} to {s_benchmark.get('spy_end_date','')})."
+            )
+            st.caption("SPY is a price-return reference, not a capital-matched portfolio benchmark; dividends, cash flows and exposure differences are not normalized.")
+        else:
+            st.info(f"SPY benchmark unavailable: {s_benchmark.get('spy_status','No usable benchmark prices returned.')}")
+        st.download_button("Download Stage 3.10 portfolio audit (CSV)",
+                           s_alloc.to_csv(index=False).encode("utf-8"),
+                           "stage3_10_portfolio_audit.csv","text/csv",use_container_width=True)
+        st.download_button("Download Stage 3.10 equity curve (CSV)",
+                           s_curve.to_csv(index=False).encode("utf-8"),
+                           "stage3_10_equity_curve.csv","text/csv",use_container_width=True)
+        st.download_button("Download Stage 3.10 slippage stress test (CSV)",
+                           s_stress.to_csv(index=False).encode("utf-8"),
+                           "stage3_10_slippage_stress.csv","text/csv",use_container_width=True)
+    st.caption(
+        "Interpretation limits: equity and drawdown update only when trades exit; open positions are not marked to market. "
+        "The longest underwater period is counted in exit events, not calendar days. Stress tests subtract additional "
+        "round-trip slippage from each trade. SPY comparison is an unlevered price-return reference, not a matched portfolio. "
+        "Historical data may contain survivorship bias, provider gaps, imperfect fills, and corporate-action limitations. "
+        "This is a research simulation only; it does not connect to a broker or execute orders."
     )

@@ -1143,3 +1143,164 @@ def analyze_signal_features(trades: pd.DataFrame, min_group_trades: int = 5) -> 
     report = pd.DataFrame(rows, columns=columns)
     ticker = report[report["feature"].eq("Ticker")].copy() if not report.empty else pd.DataFrame(columns=columns)
     return report, ticker
+
+
+def run_portfolio_robustness(
+    trades: pd.DataFrame,
+    starting_capital: float = 10000.0,
+    risk_per_trade_pct: float = 0.5,
+    max_positions: int = 5,
+    max_position_exposure_pct: float = 25.0,
+    max_gross_exposure_pct: float = 100.0,
+    extra_round_trip_cost_bps: float = 0.0,
+) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """Stage 3.10: chronological, realized-equity portfolio and robustness diagnostics.
+
+    Uses only trades with entry and exit timestamps before today's date, removes
+    duplicate symbol/horizon/direction/entry records, and sizes positions using
+    realized equity. Drawdown is exit-to-exit (not intrabar mark-to-market).
+    """
+    empty = pd.DataFrame()
+    if trades is None or trades.empty:
+        return {}, empty, empty, empty, {}
+    data = trades.copy()
+    for col in ("signal_time", "entry_time", "exit_time"):
+        data[col] = pd.to_datetime(data[col], errors="coerce", utc=True).dt.tz_convert(None)
+    today = pd.Timestamp.now().normalize()
+    raw_count = len(data)
+    data = data.dropna(subset=["entry_time", "exit_time", "net_return_pct"])
+    data = data[(data["entry_time"] < today) & (data["exit_time"] < today)].copy()
+    complete_count = len(data)
+    keys = [c for c in ("symbol", "horizon", "direction", "entry_time") if c in data.columns]
+    if keys:
+        data = data.sort_values("entry_time").drop_duplicates(keys, keep="first")
+    duplicate_count = complete_count - len(data)
+    if data.empty:
+        return {"raw_trades": raw_count, "completed_trades": 0,
+                "excluded_incomplete": raw_count, "duplicates_removed": duplicate_count}, empty, empty, empty, {}
+    data["net_return_pct"] = pd.to_numeric(data["net_return_pct"], errors="coerce")
+    data = data.dropna(subset=["net_return_pct"]).sort_values(["entry_time", "symbol"])
+    active, pending, accepted, skipped = [], [], [], []
+    equity = float(starting_capital)
+    for _, row in data.iterrows():
+        entry_time = row["entry_time"]
+        still = []
+        for exit_time, pnl in pending:
+            if exit_time <= entry_time:
+                equity += pnl
+            else:
+                still.append((exit_time, pnl))
+        pending = still
+        active = [p for p in active if p["exit_time"] > entry_time]
+        status = None
+        if any(p["symbol"] == str(row["symbol"]) for p in active):
+            status = "SKIPPED_DUPLICATE_SYMBOL"
+        elif len(active) >= int(max_positions):
+            status = "SKIPPED_MAX_POSITIONS"
+        entry, stop = float(row["entry_price"]), float(row["stop_price"])
+        stop_fraction = abs(entry-stop)/entry if entry else np.nan
+        if status is None and (not np.isfinite(stop_fraction) or stop_fraction <= 0):
+            status = "SKIPPED_INVALID_RISK"
+        active_notional = sum(p["notional"] for p in active)
+        remaining = max(0.0, equity*max_gross_exposure_pct/100-active_notional)
+        risk_budget = equity*risk_per_trade_pct/100
+        if status is None:
+            notional = min(risk_budget/stop_fraction, equity*max_position_exposure_pct/100, remaining)
+            if notional <= 0:
+                status = "SKIPPED_EXPOSURE_CAP"
+        if status:
+            item = row.to_dict()
+            item["portfolio_status"] = status
+            skipped.append(item)
+            continue
+        pnl = notional*float(row["net_return_pct"])/100
+        item = row.to_dict()
+        item.update({"portfolio_status":"TAKEN", "portfolio_equity_at_entry":equity,
+                     "risk_budget":risk_budget, "position_notional":notional,
+                     "allocated_risk_pct_equity":notional*stop_fraction/equity*100,
+                     "portfolio_pnl":pnl, "position_weight_pct":notional/equity*100})
+        accepted.append(item)
+        active.append({"symbol":str(row["symbol"]), "exit_time":row["exit_time"], "notional":notional})
+        pending.append((row["exit_time"], pnl))
+    taken = pd.DataFrame(accepted)
+    skipped_df = pd.DataFrame(skipped)
+    allocation = pd.concat([taken, skipped_df], ignore_index=True, sort=False) if not skipped_df.empty else taken.copy()
+    if taken.empty:
+        return {"raw_trades":raw_count,"completed_trades":len(data),"excluded_incomplete":raw_count-complete_count,
+                "duplicates_removed":duplicate_count,"accepted_trades":0}, allocation, empty, empty, {}
+    # Exit-event account curve, sorted chronologically.
+    events = taken.sort_values(["exit_time","symbol"])
+    acct, peak, curve_rows = float(starting_capital), float(starting_capital), []
+    for _, t in events.iterrows():
+        acct += float(t["portfolio_pnl"])
+        peak = max(peak, acct)
+        curve_rows.append({"time":t["exit_time"],"equity":acct,
+                           "drawdown_pct":(acct/peak-1)*100,
+                           "symbol":t["symbol"],"pnl":t["portfolio_pnl"]})
+    curve = pd.DataFrame(curve_rows)
+    pnl = taken["portfolio_pnl"].astype(float)
+    wins, losses = pnl[pnl>0], pnl[pnl<0]
+    gross_profit, gross_loss = float(wins.sum()), float(abs(losses.sum()))
+    pf = gross_profit/gross_loss if gross_loss else (float("inf") if gross_profit else 0.0)
+    peak_to_valley = curve["drawdown_pct"].astype(float)
+    loss_flags = (pnl < 0).tolist()
+    max_streak = streak = 0
+    for is_loss in loss_flags:
+        streak = streak+1 if is_loss else 0
+        max_streak = max(max_streak, streak)
+    # Recovery measured in exit events from first drawdown trough to prior equity peak.
+    eq = curve["equity"].astype(float)
+    running_peak = eq.cummax()
+    under = eq < running_peak
+    recovery_events = 0
+    if under.any():
+        longest, current = 0, 0
+        for is_under in under:
+            current = current+1 if is_under else 0
+            longest = max(longest,current)
+        recovery_events = int(longest)
+    symbol_pnl = taken.groupby("symbol")["portfolio_pnl"].sum().sort_values(ascending=False)
+    concentration = (float(symbol_pnl.head(3).sum()/pnl.sum()*100)
+                     if pnl.sum() > 0 else np.nan)
+    summary = {
+        "raw_trades":raw_count, "completed_trades":len(data),
+        "excluded_incomplete":raw_count-complete_count, "duplicates_removed":duplicate_count,
+        "accepted_trades":len(taken), "skipped_trades":len(data)-len(taken),
+        "ending_equity":float(curve["equity"].iloc[-1]),
+        "portfolio_return_pct":float((curve["equity"].iloc[-1]/starting_capital-1)*100),
+        "profit_factor":float(pf), "win_rate_pct":float((pnl>0).mean()*100),
+        "max_exit_to_exit_drawdown_pct":float(peak_to_valley.min()),
+        "max_consecutive_losses":int(max_streak),
+        "longest_underwater_exit_events":recovery_events,
+        "top3_ticker_pnl_share_pct":concentration,
+        "max_position_weight_pct":float(taken["position_weight_pct"].max()),
+        "max_allocated_risk_pct_equity":float(taken["allocated_risk_pct_equity"].max()),
+    }
+    stress_rows=[]
+    for extra_bps in (0, 5, 10, 20, 40):
+        stressed = taken.copy()
+        stressed["stress_return_pct"] = stressed["net_return_pct"].astype(float)-2*extra_bps/100
+        stressed_pnl = stressed["position_notional"]*stressed["stress_return_pct"]/100
+        final = float(starting_capital+stressed_pnl.sum())
+        stress_rows.append({"additional_slippage_bps_per_side":extra_bps,
+                            "ending_equity":final,
+                            "portfolio_return_pct":(final/starting_capital-1)*100,
+                            "total_pnl":float(stressed_pnl.sum())})
+    stress = pd.DataFrame(stress_rows)
+    benchmark = {}
+    try:
+        start = data["entry_time"].min().date().isoformat()
+        end = (data["exit_time"].max()+pd.Timedelta(days=2)).date().isoformat()
+        spy = yf.download("SPY", start=start, end=end, interval="1d",
+                          auto_adjust=True, progress=False, threads=False)
+        if isinstance(spy.columns,pd.MultiIndex):
+            spy.columns=spy.columns.get_level_values(0)
+        if not spy.empty and "Close" in spy:
+            prices = pd.to_numeric(spy["Close"],errors="coerce").dropna()
+            if len(prices)>=2:
+                benchmark={"spy_start":float(prices.iloc[0]),"spy_end":float(prices.iloc[-1]),
+                           "spy_buy_hold_return_pct":float((prices.iloc[-1]/prices.iloc[0]-1)*100),
+                           "spy_start_date":str(prices.index[0]),"spy_end_date":str(prices.index[-1])}
+    except Exception as exc:
+        benchmark={"spy_status":f"Unavailable: {str(exc)[:160]}"}
+    return summary, allocation, curve, stress, benchmark
