@@ -167,7 +167,7 @@ if run_bt:
     if not bt_symbols:
         st.error("Enter at least one ticker symbol.")
     else:
-        with st.spinner("Downloading historical bars and simulating trades. Intraday history is limited to approximately five trading days by the current provider."):
+        with st.spinner("Downloading historical bars and simulating trades. Intraday history is requested over the provider's maximum approximately 60-day window."):
             normalized_horizon = (
                 "Both" if bt_horizon == "Both (daily + intraday)" else bt_horizon
             )
@@ -215,8 +215,8 @@ if "bt_trades" in st.session_state:
     coverage = st.session_state.get("bt_coverage", pd.DataFrame())
     if not coverage.empty:
         st.dataframe(coverage, use_container_width=True, hide_index=True)
-        if (coverage["coverage_status"] == "LIMITED HISTORY").any():
-            st.warning("Intraday results use a very short provider history window. Treat day-trading statistics as preliminary, not robust out-of-sample evidence.")
+        if (coverage["coverage_status"] == "EXTENDED, STILL LIMITED").any():
+            st.warning("Intraday history has been extended to the provider's approximate 60-day limit. This improves session coverage, but it is still not multi-year or multi-regime evidence. Treat day-trading results as preliminary.")
     if bt_trades.empty or allocated.empty or not bt_summary:
         st.warning("No portfolio trades were generated. The coverage audit above still shows whether usable historical bars were available.")
     else:

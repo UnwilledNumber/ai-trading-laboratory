@@ -15,9 +15,13 @@ def _download_history(symbol: str, horizon: str) -> pd.DataFrame:
                           progress=False, threads=False)
         intraday = False
     else:
-        # Yahoo Finance generally limits 5-minute history to approximately 5 trading days.
-        raw = yf.download(symbol, period="5d", interval="5m", auto_adjust=True,
-                          progress=False, threads=False)
+        # Yahoo Finance limits intraday history to roughly the most recent 60
+        # calendar days. Request the longest supported window for a more useful
+        # session-level research sample than the previous 5-day prototype.
+        end_date = (pd.Timestamp.now(tz="America/New_York").normalize() + pd.Timedelta(days=1)).date()
+        start_date = end_date - pd.Timedelta(days=59)
+        raw = yf.download(symbol, start=start_date.isoformat(), end=end_date.isoformat(),
+                          interval="5m", auto_adjust=True, progress=False, threads=False)
         intraday = True
     if raw is None or raw.empty:
         return pd.DataFrame()
@@ -39,7 +43,7 @@ def audit_history_coverage(symbols: list[str], horizons: list[str] | None = None
     for horizon in horizons:
         intraday = str(horizon).strip().lower() in {"day trading", "intraday", "day-trading"}
         interval = "5m" if intraday else "1d"
-        requested_period = "5d" if intraday else "5y"
+        requested_period = "~60 calendar days (provider intraday limit)" if intraday else "5y"
         warmup = 35 if intraday else 210
         for symbol in unique_symbols:
             try:
@@ -56,8 +60,10 @@ def audit_history_coverage(symbols: list[str], horizons: list[str] | None = None
                     status = "INSUFFICIENT BARS"
                     note = f"{count} bars; {warmup} required for indicator warmup."
                 elif intraday:
-                    status = "LIMITED HISTORY"
-                    note = "Yahoo 5-minute feed is requested at 5d; too short for robust multi-regime validation."
+                    status = "EXTENDED, STILL LIMITED"
+                    note = (f"Loaded {sessions} sessions where available. Yahoo 5-minute history is limited "
+                            "to approximately 60 calendar days; this is a larger sample, but not multi-year "
+                            "or multi-regime validation.")
                 else:
                     status = "USABLE"
                     note = "Daily history available for swing research; check start/end dates for gaps."
