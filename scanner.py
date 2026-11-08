@@ -23,8 +23,8 @@ DEFAULT_WATCHLIST = [
 ]
 DATA_NOTE = (
     "Data source: Yahoo Finance through yfinance (unofficial). Quotes may be delayed, "
-    "intraday history is limited, and bulk requests can be throttled. Do not use this "
-    "prototype as an execution-grade real-time feed."
+    "intraday history is limited, and bulk requests can be throttled. Short signals "
+    "are research flags, not confirmation that shares are borrowable or shortable."
 )
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("market_scanner")
@@ -33,7 +33,7 @@ NASDAQ_TRADED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.tx
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 
 def clean_symbol(symbol: str) -> str:
-    return str(symbol).strip().replace("$", "").replace(".", "-")
+    return str(symbol).strip().replace("$", "").replace(".", "-").upper()
 
 def load_watchlist() -> list[str]:
     if WATCHLIST_FILE.exists():
@@ -110,55 +110,104 @@ def add_indicators(df: pd.DataFrame, intraday: bool = False) -> pd.DataFrame:
     out["DOLLAR_VOLUME"] = close * volume
     return out
 
+def _safe_float(value, default=np.nan):
+    try:
+        return float(value) if pd.notna(value) else default
+    except (TypeError, ValueError):
+        return default
+
 def _score_daily(df: pd.DataFrame, symbol: str, min_price: float, min_dv: float):
     if len(df) < 60:
         return None
     r = df.iloc[-1]
-    price = float(r["Close"])
-    avg_dv = float(df["DOLLAR_VOLUME"].tail(20).mean())
+    price = _safe_float(r["Close"])
+    avg_dv = _safe_float(df["DOLLAR_VOLUME"].tail(20).mean(), 0)
     if not np.isfinite(price) or price < min_price or avg_dv < min_dv:
         return None
-    rv = float(r["RSI14"]) if pd.notna(r["RSI14"]) else 0
-    rvol = float(r["RVOL"]) if pd.notna(r["RVOL"]) else 0
-    trend = r["Close"] > r["EMA50"] > r["EMA200"]
-    short = r["EMA9"] > r["EMA21"]
+
+    rsi_v = _safe_float(r["RSI14"], 50)
+    rvol = _safe_float(r["RVOL"], 0)
+    ema9, ema21, ema50, ema200 = [_safe_float(r[k]) for k in ("EMA9","EMA21","EMA50","EMA200")]
     macd_bull = r["MACD"] > r["MACD_SIGNAL"]
-    prior_high = float(df["High"].iloc[-21:-1].max())
+    trend_up = price > ema50 > ema200
+    trend_down = price < ema50 < ema200
+    short_up = ema9 > ema21
+    short_down = ema9 < ema21
+    prior_high = _safe_float(df["High"].iloc[-21:-1].max())
+    prior_low = _safe_float(df["Low"].iloc[-21:-1].min())
     breakout = price > prior_high
-    reversal = rv < 35 and price > r["EMA9"] and macd_bull
-    score = (20 if trend else 0) + (15 if short else 0) + (15 if macd_bull else 0)
-    score += (15 if breakout else 0) + (10 if rvol >= 1.5 else 0)
-    score += (10 if 50 <= rv <= 70 else 0) + (5 if r["ATR_PCT"] >= 1 else 0) + (10 if reversal else 0)
-    signal = "BREAKOUT" if breakout else "REVERSAL WATCH" if reversal else "MOMENTUM" if trend and short and macd_bull and 45 <= rv <= 75 else "WATCH"
-    return {"symbol":symbol,"timeframe":"1D","signal":signal,"score":int(score),"price":price,
-            "rsi14":rv,"rvol":rvol,"ema9":float(r["EMA9"]),"ema21":float(r["EMA21"]),
-            "ema50":float(r["EMA50"]),"ema200":float(r["EMA200"]),
-            "macd_hist":float(r["MACD"]-r["MACD_SIGNAL"]),"atr_pct":float(r["ATR_PCT"]),
-            "avg_dollar_volume_20d":avg_dv,"close_vs_20d_high_pct":(price/prior_high-1)*100 if prior_high else np.nan}
+    breakdown = price < prior_low
+
+    long_score = (20 if trend_up else 0) + (15 if short_up else 0) + (15 if macd_bull else 0)
+    long_score += (15 if breakout else 0) + (10 if rvol >= 1.5 else 0)
+    long_score += (10 if 50 <= rsi_v <= 70 else 0) + (5 if _safe_float(r["ATR_PCT"],0) >= 1 else 0)
+
+    short_score = (20 if trend_down else 0) + (15 if short_down else 0) + (15 if not macd_bull else 0)
+    short_score += (15 if breakdown else 0) + (10 if rvol >= 1.5 else 0)
+    short_score += (10 if 30 <= rsi_v <= 50 else 0) + (5 if _safe_float(r["ATR_PCT"],0) >= 1 else 0)
+
+    if breakout and long_score >= short_score:
+        direction, signal, score = "LONG", "BULLISH BREAKOUT", long_score
+    elif breakdown and short_score > long_score:
+        direction, signal, score = "SHORT", "BEARISH BREAKDOWN", short_score
+    elif long_score >= short_score:
+        direction, signal, score = "LONG", "BULLISH MOMENTUM" if trend_up and short_up and macd_bull else "LONG WATCH", long_score
+    else:
+        direction, signal, score = "SHORT", "BEARISH MOMENTUM" if trend_down and short_down and not macd_bull else "SHORT WATCH", short_score
+
+    return {
+        "symbol":symbol,"timeframe":"1D","horizon":"Swing","direction":direction,
+        "signal":signal,"score":int(score),"price":price,"rsi14":rsi_v,"rvol":rvol,
+        "ema9":ema9,"ema21":ema21,"ema50":ema50,"ema200":ema200,
+        "macd_hist":_safe_float(r["MACD"]-r["MACD_SIGNAL"]),
+        "atr":_safe_float(r["ATR14"]),"atr_pct":_safe_float(r["ATR_PCT"]),
+        "vwap":np.nan,"avg_dollar_volume_20d":avg_dv,
+        "breakout_level":prior_high,"breakdown_level":prior_low
+    }
 
 def _score_intraday(df: pd.DataFrame, symbol: str, min_price: float):
     if len(df) < 30:
         return None
     r = df.iloc[-1]
-    price = float(r["Close"])
+    price = _safe_float(r["Close"])
     if not np.isfinite(price) or price < min_price:
         return None
-    rv = float(r["RSI14"]) if pd.notna(r["RSI14"]) else 0
-    rvol = float(r["RVOL"]) if pd.notna(r["RVOL"]) else 0
-    vwap = float(r["VWAP"]) if pd.notna(r["VWAP"]) else np.nan
-    above = np.isfinite(vwap) and price > vwap
-    short = r["EMA9"] > r["EMA21"]
-    macd_bull = r["MACD"] > r["MACD_SIGNAL"]
-    prior_high = float(df["High"].iloc[-13:-1].max())
+    rsi_v = _safe_float(r["RSI14"], 50)
+    rvol = _safe_float(r["RVOL"], 0)
+    vwap = _safe_float(r["VWAP"])
+    above_vwap = np.isfinite(vwap) and price > vwap
+    below_vwap = np.isfinite(vwap) and price < vwap
+    ema_up = r["EMA9"] > r["EMA21"]
+    ema_down = r["EMA9"] < r["EMA21"]
+    macd_up = r["MACD"] > r["MACD_SIGNAL"]
+    macd_down = not macd_up
+    prior_high = _safe_float(df["High"].iloc[-13:-1].max())
+    prior_low = _safe_float(df["Low"].iloc[-13:-1].min())
     breakout = price > prior_high and rvol >= 1.5
-    momentum = above and short and macd_bull and 45 <= rv <= 78
-    score = (20 if above else 0) + (15 if short else 0) + (15 if macd_bull else 0)
-    score += (20 if rvol >= 1.5 else 0) + (10 if 50 <= rv <= 72 else 0) + (20 if breakout else 0)
-    signal = "INTRADAY BREAKOUT" if breakout else "INTRADAY MOMENTUM" if momentum else "WATCH"
-    return {"symbol":symbol,"timeframe":"5m","signal":signal,"score":int(score),"price":price,
-            "rsi14":rv,"rvol":rvol,"vwap":vwap,"above_vwap":bool(above),
-            "ema9":float(r["EMA9"]),"ema21":float(r["EMA21"]),
-            "macd_hist":float(r["MACD"]-r["MACD_SIGNAL"]),"atr_pct":float(r["ATR_PCT"])}
+    breakdown = price < prior_low and rvol >= 1.5
+
+    long_score = (20 if above_vwap else 0) + (15 if ema_up else 0) + (15 if macd_up else 0)
+    long_score += (20 if rvol >= 1.5 else 0) + (10 if 50 <= rsi_v <= 72 else 0) + (20 if breakout else 0)
+    short_score = (20 if below_vwap else 0) + (15 if ema_down else 0) + (15 if macd_down else 0)
+    short_score += (20 if rvol >= 1.5 else 0) + (10 if 28 <= rsi_v <= 50 else 0) + (20 if breakdown else 0)
+
+    if breakout and long_score >= short_score:
+        direction, signal, score = "LONG", "INTRADAY BULLISH BREAKOUT", long_score
+    elif breakdown and short_score > long_score:
+        direction, signal, score = "SHORT", "INTRADAY BEARISH BREAKDOWN", short_score
+    elif long_score >= short_score:
+        direction, signal, score = "LONG", "INTRADAY BULLISH MOMENTUM" if above_vwap and ema_up and macd_up else "LONG WATCH", long_score
+    else:
+        direction, signal, score = "SHORT", "INTRADAY BEARISH MOMENTUM" if below_vwap and ema_down and macd_down else "SHORT WATCH", short_score
+
+    return {
+        "symbol":symbol,"timeframe":"5m","horizon":"Day trade","direction":direction,
+        "signal":signal,"score":int(score),"price":price,"rsi14":rsi_v,"rvol":rvol,
+        "vwap":vwap,"ema9":_safe_float(r["EMA9"]),"ema21":_safe_float(r["EMA21"]),
+        "macd_hist":_safe_float(r["MACD"]-r["MACD_SIGNAL"]),
+        "atr":_safe_float(r["ATR14"]),"atr_pct":_safe_float(r["ATR_PCT"]),
+        "avg_dollar_volume_20d":np.nan,"breakout_level":prior_high,"breakdown_level":prior_low
+    }
 
 def _download(symbols: list[str], period: str, interval: str) -> dict[str,pd.DataFrame]:
     if not symbols:
@@ -191,9 +240,10 @@ def scan_market(symbols: list[str], mode: str = "both", min_price: float = 2.0,
     results = []
     symbols = list(dict.fromkeys(clean_symbol(s) for s in symbols if s))
     batch_size = 25
-    total_tasks = len(symbols) * (2 if mode == "both" else 1)
+    timeframes = ["daily","intraday"] if mode == "both" else [mode]
+    total_tasks = len(symbols) * len(timeframes)
     completed = 0
-    for timeframe in (["daily","intraday"] if mode == "both" else [mode]):
+    for timeframe in timeframes:
         for start in range(0, len(symbols), batch_size):
             batch = symbols[start:start+batch_size]
             if timeframe == "daily":
@@ -219,3 +269,15 @@ def scan_market(symbols: list[str], mode: str = "both", min_price: float = 2.0,
     if not results:
         return pd.DataFrame()
     return pd.DataFrame(results).sort_values(["score","rvol"], ascending=[False,False]).reset_index(drop=True)
+
+def fetch_chart_data(symbol: str, timeframe: str = "1D") -> pd.DataFrame:
+    period, interval = ("3mo", "1d") if timeframe == "1D" else ("5d", "5m")
+    frame = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(0)
+    needed = ["Open","High","Low","Close","Volume"]
+    if not all(c in frame.columns for c in needed):
+        return pd.DataFrame()
+    return add_indicators(frame[needed].dropna(subset=["Close"]), intraday=(timeframe != "1D"))
