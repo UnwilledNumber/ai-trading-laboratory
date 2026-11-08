@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
 from scanner import add_indicators, _score_daily, _score_intraday
 
+@lru_cache(maxsize=64)
 def _download_history(symbol: str, horizon: str) -> pd.DataFrame:
     if horizon == "Swing":
         raw = yf.download(symbol, period="5y", interval="1d", auto_adjust=True,
@@ -27,6 +30,54 @@ def _download_history(symbol: str, horizon: str) -> pd.DataFrame:
     if frame.empty:
         return frame
     return add_indicators(frame, intraday=intraday)
+
+def audit_history_coverage(symbols: list[str], horizons: list[str] | None = None) -> pd.DataFrame:
+    """Report actual historical coverage and warmup-eligible bars per symbol/horizon."""
+    horizons = horizons or ["Swing", "Day trading"]
+    rows = []
+    unique_symbols = list(dict.fromkeys(str(s).strip().upper() for s in symbols if str(s).strip()))
+    for horizon in horizons:
+        intraday = str(horizon).strip().lower() in {"day trading", "intraday", "day-trading"}
+        interval = "5m" if intraday else "1d"
+        requested_period = "5d" if intraday else "5y"
+        warmup = 35 if intraday else 210
+        for symbol in unique_symbols:
+            try:
+                bars = _download_history(symbol, "Day trading" if intraday else "Swing")
+                count = int(len(bars))
+                sessions = (int(pd.Index(pd.to_datetime(bars.index).date).nunique()) if count else 0)
+                eligible = max(0, count - warmup)
+                start = str(bars.index.min()) if count else ""
+                end = str(bars.index.max()) if count else ""
+                if not count:
+                    status = "NO DATA"
+                    note = "Provider returned no usable bars."
+                elif eligible < 3:
+                    status = "INSUFFICIENT BARS"
+                    note = f"{count} bars; {warmup} required for indicator warmup."
+                elif intraday:
+                    status = "LIMITED HISTORY"
+                    note = "Yahoo 5-minute feed is requested at 5d; too short for robust multi-regime validation."
+                else:
+                    status = "USABLE"
+                    note = "Daily history available for swing research; check start/end dates for gaps."
+                rows.append({
+                    "symbol": symbol, "horizon": "Day trading" if intraday else "Swing",
+                    "interval": interval, "requested_period": requested_period,
+                    "bars": count, "sessions": sessions, "warmup_bars": warmup,
+                    "eligible_bars": eligible, "first_bar": start, "last_bar": end,
+                    "coverage_status": status, "coverage_note": note,
+                })
+            except Exception as exc:
+                rows.append({
+                    "symbol": symbol, "horizon": "Day trading" if intraday else "Swing",
+                    "interval": interval, "requested_period": requested_period,
+                    "bars": 0, "sessions": 0, "warmup_bars": warmup,
+                    "eligible_bars": 0, "first_bar": "", "last_bar": "",
+                    "coverage_status": "DOWNLOAD ERROR", "coverage_note": str(exc)[:180],
+                })
+    return pd.DataFrame(rows)
+
 
 def _get_signal(history: pd.DataFrame, i: int, horizon: str, min_price: float,
                 min_dollar_volume: float) -> dict | None:
@@ -458,60 +509,91 @@ def build_benchmark_report(symbols: list[str], horizons: list[str]) -> pd.DataFr
 
 
 def summarize_sample_by_strategy(trades: pd.DataFrame, sample_name: str) -> pd.DataFrame:
-    """Trade-level in/out-of-sample diagnostics for all four strategy buckets."""
-    cols = ["sample", "strategy", "trades", "win_rate_pct",
-            "profit_factor", "mean_trade_pct"]
-    if trades.empty:
-        return pd.DataFrame(columns=cols)
+    """Trade-level validation for all four horizon/direction buckets, including zeros."""
+    cols = ["sample", "strategy", "trades", "sessions", "win_rate_pct",
+            "profit_factor", "mean_trade_pct", "expectancy_pct"]
     rows = []
     for horizon, direction in [
         ("Swing", "LONG"), ("Swing", "SHORT"),
         ("Day trading", "LONG"), ("Day trading", "SHORT"),
     ]:
         group = trades[
-            (trades["horizon"].astype(str) == horizon) &
-            (trades["direction"].astype(str) == direction)
-        ]
+            (trades.get("horizon", pd.Series(index=trades.index, dtype=str)).astype(str) == horizon) &
+            (trades.get("direction", pd.Series(index=trades.index, dtype=str)).astype(str).str.upper() == direction)
+        ] if not trades.empty else pd.DataFrame()
         if group.empty:
+            rows.append({"sample": sample_name, "strategy": f"{horizon} {direction}",
+                         "trades": 0, "sessions": 0, "win_rate_pct": np.nan,
+                         "profit_factor": np.nan, "mean_trade_pct": np.nan, "expectancy_pct": np.nan})
             continue
-        r = group["net_return_pct"].astype(float)
+        r = pd.to_numeric(group["net_return_pct"], errors="coerce").dropna()
         wins, losses = r[r > 0], r[r < 0]
         gp, gl = float(wins.sum()), float(abs(losses.sum()))
+        dates = pd.to_datetime(group["entry_time"], errors="coerce", utc=True).dt.tz_convert(None).dt.date
         rows.append({
-            "sample": sample_name,
-            "strategy": f"{horizon} {direction}",
-            "trades": int(len(group)),
+            "sample": sample_name, "strategy": f"{horizon} {direction}",
+            "trades": int(len(r)), "sessions": int(dates.nunique()),
             "win_rate_pct": float((r > 0).mean() * 100),
             "profit_factor": gp / gl if gl > 0 else (float("inf") if gp > 0 else 0.0),
-            "mean_trade_pct": float(r.mean()),
+            "mean_trade_pct": float(r.mean()), "expectancy_pct": float(r.mean()),
         })
     return pd.DataFrame(rows, columns=cols)
 
-def make_walk_forward_split(trades: pd.DataFrame, train_fraction: float = 0.70):
-    """Chronological split using timezone-normalized timestamps.
 
-    Daily and intraday feeds can return naive and timezone-aware timestamps.
-    Normalize both to UTC-naive before sorting/comparison to avoid pandas
-    mixed-timezone TypeErrors.
-    """
+def strategy_split_diagnostics(trades: pd.DataFrame, train_fraction: float = 0.70) -> pd.DataFrame:
+    """Show whether each of the four strategies has enough distinct sessions to split."""
+    rows = []
+    for horizon, direction in [
+        ("Swing", "LONG"), ("Swing", "SHORT"),
+        ("Day trading", "LONG"), ("Day trading", "SHORT"),
+    ]:
+        group = trades[(trades["horizon"].astype(str) == horizon) &
+                       (trades["direction"].astype(str).str.upper() == direction)] if not trades.empty else pd.DataFrame()
+        if group.empty:
+            rows.append({"strategy": f"{horizon} {direction}", "candidate_trades": 0,
+                         "distinct_sessions": 0, "split_cutoff_session": "",
+                         "validation_status": "NO TRADES"})
+            continue
+        dates = pd.to_datetime(group["entry_time"], errors="coerce", utc=True).dt.tz_convert(None).dt.date
+        sessions = sorted(d for d in dates.dropna().unique())
+        if len(sessions) < 3:
+            status, cutoff = "INSUFFICIENT SESSIONS (<3)", ""
+        else:
+            idx = max(1, min(len(sessions)-1, int(len(sessions)*train_fraction)))
+            cutoff = str(sessions[idx])
+            status = "SPLITTABLE"
+        rows.append({"strategy": f"{horizon} {direction}",
+                     "candidate_trades": int(len(group)), "distinct_sessions": len(sessions),
+                     "split_cutoff_session": cutoff, "validation_status": status})
+    return pd.DataFrame(rows)
+
+
+def make_walk_forward_split(trades: pd.DataFrame, train_fraction: float = 0.70):
+    """Split each strategy independently by whole trading sessions, not mixed horizons."""
     if trades.empty:
         return pd.DataFrame(), pd.DataFrame()
     ordered = trades.copy()
-    normalized_entry = pd.to_datetime(ordered["entry_time"], errors="coerce", utc=True).dt.tz_convert(None)
-    valid = normalized_entry.notna()
-    ordered = ordered.loc[valid].copy()
-    normalized_entry = normalized_entry.loc[valid]
-    if ordered.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    ordered["_normalized_entry_time"] = normalized_entry
-    ordered = ordered.sort_values("_normalized_entry_time", kind="mergesort")
-    unique_dates = ordered["_normalized_entry_time"].drop_duplicates().sort_values().to_numpy()
-    if len(unique_dates) < 3:
-        return ordered.drop(columns=["_normalized_entry_time"]), pd.DataFrame()
-    split_index = max(1, min(len(unique_dates)-1, int(len(unique_dates)*train_fraction)))
-    cutoff = unique_dates[split_index]
-    train = ordered[ordered["_normalized_entry_time"] < cutoff].drop(columns=["_normalized_entry_time"]).copy()
-    test = ordered[ordered["_normalized_entry_time"] >= cutoff].drop(columns=["_normalized_entry_time"]).copy()
+    normalized = pd.to_datetime(ordered["entry_time"], errors="coerce", utc=True).dt.tz_convert(None)
+    ordered = ordered.loc[normalized.notna()].copy()
+    ordered["_session_date"] = normalized.loc[normalized.index].dt.date
+    train_parts, test_parts = [], []
+    for horizon, direction in [("Swing", "LONG"), ("Swing", "SHORT"),
+                               ("Day trading", "LONG"), ("Day trading", "SHORT")]:
+        group = ordered[(ordered["horizon"].astype(str) == horizon) &
+                        (ordered["direction"].astype(str).str.upper() == direction)].copy()
+        sessions = sorted(group["_session_date"].dropna().unique())
+        # Fewer than three sessions cannot support a minimally meaningful chronological split.
+        if len(sessions) < 3:
+            continue
+        split_index = max(1, min(len(sessions)-1, int(len(sessions)*train_fraction)))
+        cutoff = sessions[split_index]
+        train_parts.append(group[group["_session_date"] < cutoff])
+        test_parts.append(group[group["_session_date"] >= cutoff])
+    train = pd.concat(train_parts, ignore_index=True) if train_parts else pd.DataFrame()
+    test = pd.concat(test_parts, ignore_index=True) if test_parts else pd.DataFrame()
+    for frame in (train, test):
+        if not frame.empty and "_session_date" in frame.columns:
+            frame.drop(columns=["_session_date"], inplace=True)
     return train, test
 
 

@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy)
+from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics)
 
 from scanner import (
     fetch_universe, scan_market, load_watchlist, save_watchlist,
@@ -184,6 +184,10 @@ if run_bt:
             max_position_exposure_pct=float(bt_position_cap),
         )
         st.session_state["bt_trades"] = bt_trades
+        st.session_state["bt_coverage"] = audit_history_coverage(
+            bt_symbols, ["Swing", "Day trading"] if normalized_horizon == "Both" else
+            (["Day trading"] if str(normalized_horizon).lower() in {"day trading", "intraday"} else ["Swing"])
+        )
         st.session_state["bt_allocated"] = allocated
         st.session_state["bt_summary"], st.session_state["bt_equity"] = summarize_portfolio(
             allocated, equity, starting_capital=float(bt_capital)
@@ -196,9 +200,10 @@ if run_bt:
         st.session_state["bt_benchmark"] = build_benchmark_report(
             bt_symbols, benchmark_horizons
         )
-        train_trades, test_trades = make_walk_forward_split(
-            allocated[allocated["portfolio_status"] == "TAKEN"] if not allocated.empty else allocated
-        )
+        # Validate signal candidates before portfolio allocation so exposure caps do not
+        # distort the independent performance of each strategy.
+        train_trades, test_trades = make_walk_forward_split(bt_trades)
+        st.session_state["bt_split_diagnostics"] = strategy_split_diagnostics(bt_trades)
         st.session_state["bt_train"] = train_trades
         st.session_state["bt_test"] = test_trades
 
@@ -206,8 +211,14 @@ if "bt_trades" in st.session_state:
     bt_trades = st.session_state["bt_trades"]
     allocated = st.session_state.get("bt_allocated", pd.DataFrame())
     bt_summary = st.session_state.get("bt_summary", {})
+    st.subheader("Historical data coverage audit")
+    coverage = st.session_state.get("bt_coverage", pd.DataFrame())
+    if not coverage.empty:
+        st.dataframe(coverage, use_container_width=True, hide_index=True)
+        if (coverage["coverage_status"] == "LIMITED HISTORY").any():
+            st.warning("Intraday results use a very short provider history window. Treat day-trading statistics as preliminary, not robust out-of-sample evidence.")
     if bt_trades.empty or allocated.empty or not bt_summary:
-        st.warning("No portfolio trades were generated. Try a lower signal score, another symbol, or swing timeframe.")
+        st.warning("No portfolio trades were generated. The coverage audit above still shows whether usable historical bars were available.")
     else:
         st.subheader("Portfolio backtest results")
         st.caption("Capital-aware simulation with risk-based sizing, concurrent-position limits, and gross-exposure caps.")
@@ -249,22 +260,22 @@ if "bt_trades" in st.session_state:
         else:
             st.info("Benchmark data was unavailable for the selected symbols.")
 
-        st.subheader("Chronological 70/30 research split")
+        st.subheader("Independent strategy validation — chronological 70/30")
+        st.caption("Each horizon/direction strategy is split separately by whole trading sessions. These are raw signal candidates before portfolio allocation, so capital limits do not bias the strategy comparison.")
+        split_diag = st.session_state.get("bt_split_diagnostics", pd.DataFrame())
+        if not split_diag.empty:
+            st.dataframe(split_diag, use_container_width=True, hide_index=True)
         train = st.session_state.get("bt_train", pd.DataFrame())
         test = st.session_state.get("bt_test", pd.DataFrame())
-        if not train.empty and not test.empty:
-            c1,c2 = st.columns(2)
-            c1.metric("In-sample trades (70%)", len(train))
-            c2.metric("Out-of-sample trades (30%)", len(test))
-            st.caption("The final 30% is held out chronologically for a basic out-of-sample check. Do not tune rules against this holdout and then treat it as independent.")
+        if not train.empty or not test.empty:
             split_report = pd.concat([
                 summarize_sample_by_strategy(train, "In-sample"),
                 summarize_sample_by_strategy(test, "Out-of-sample"),
             ], ignore_index=True)
-            if not split_report.empty:
-                st.dataframe(split_report.round(3), use_container_width=True, hide_index=True)
+            st.dataframe(split_report.round(3), use_container_width=True, hide_index=True)
+            st.caption("Do not tune parameters against the out-of-sample portion and then treat it as independent.")
         else:
-            st.info("Not enough distinct trade dates to form both in-sample and out-of-sample periods.")
+            st.info("No strategy has at least three distinct trading sessions available for a chronological split. The coverage audit explains the data limitation.")
 
         st.write("**Trade log (portfolio allocations)**")
         display_cols = ["symbol","horizon","direction","signal_time","entry_time","exit_time",
