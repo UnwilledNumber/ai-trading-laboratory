@@ -187,7 +187,18 @@ def run_backtest(
     slippage_bps: float = 5.0,
     fee_bps_per_side: float = 0.0,
 ) -> pd.DataFrame:
-    horizons = ["Swing", "Day trading"] if horizon == "Both" else [horizon]
+    horizon_key = str(horizon).strip().lower()
+    if horizon_key in {"both", "both (daily + intraday)", "both (daily and intraday)"}:
+        horizons = ["Swing", "Day trading"]
+    elif horizon_key in {"swing", "swing trading", "daily"}:
+        horizons = ["Swing"]
+    elif horizon_key in {"day trading", "intraday", "day-trading"}:
+        horizons = ["Day trading"]
+    else:
+        raise ValueError(
+            f"Unsupported backtest horizon: {horizon!r}. "
+            "Use Both, Swing, or Day trading."
+        )
     frames = []
     for selected_horizon in horizons:
         for symbol in list(dict.fromkeys(s.strip().upper() for s in symbols if s.strip())):
@@ -373,9 +384,13 @@ def summarize_by_strategy(allocated_trades: pd.DataFrame) -> pd.DataFrame:
     ]
     rows = []
     for horizon, direction in expected:
+        horizon_values = taken["horizon"].astype(str).str.strip().str.lower()
+        direction_values = taken["direction"].astype(str).str.strip().str.upper()
+        horizon_aliases = {"swing": {"swing", "swing trading", "daily"},
+                           "day trading": {"day trading", "intraday", "day-trading"}}
         group = taken[
-            (taken["horizon"].astype(str) == horizon) &
-            (taken["direction"].astype(str) == direction)
+            horizon_values.isin(horizon_aliases[horizon.lower()]) &
+            (direction_values == direction)
         ]
         if group.empty:
             rows.append({

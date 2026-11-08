@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from backtest import run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split
+from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy)
 
 from scanner import (
     fetch_universe, scan_market, load_watchlist, save_watchlist,
@@ -168,8 +168,11 @@ if run_bt:
         st.error("Enter at least one ticker symbol.")
     else:
         with st.spinner("Downloading historical bars and simulating trades. Intraday history is limited to approximately five trading days by the current provider."):
+            normalized_horizon = (
+                "Both" if bt_horizon == "Both (daily + intraday)" else bt_horizon
+            )
             bt_trades = run_backtest(
-                bt_symbols, horizon=bt_horizon, direction=bt_direction,
+                bt_symbols, horizon=normalized_horizon, direction=bt_direction,
                 min_score=bt_min_score, min_price=2.0,
                 min_dollar_volume=5_000_000, stop_atr=float(bt_stop_atr),
                 target_r=float(bt_target_r), slippage_bps=float(bt_slippage),
@@ -186,6 +189,13 @@ if run_bt:
             allocated, equity, starting_capital=float(bt_capital)
         )
         st.session_state["bt_strategy"] = summarize_by_strategy(allocated)
+        benchmark_horizons = (
+            ["Swing", "Day trading"]
+            if normalized_horizon == "Both" else [normalized_horizon]
+        )
+        st.session_state["bt_benchmark"] = build_benchmark_report(
+            bt_symbols, benchmark_horizons
+        )
         train_trades, test_trades = make_walk_forward_split(
             allocated[allocated["portfolio_status"] == "TAKEN"] if not allocated.empty else allocated
         )
@@ -225,6 +235,19 @@ if "bt_trades" in st.session_state:
         strategy = st.session_state.get("bt_strategy", pd.DataFrame())
         if not strategy.empty:
             st.dataframe(strategy.round(3), use_container_width=True, hide_index=True)
+            if int(strategy["trades"].sum()) == 0 and not allocated.empty:
+                st.warning(
+                    "Strategy buckets found no matching horizon labels. "
+                                       "Inspect the trade log's horizon column; do not interpret these zeros as no signals."
+                )
+
+        st.subheader("Buy-and-hold reference benchmark")
+        benchmark = st.session_state.get("bt_benchmark", pd.DataFrame())
+        if not benchmark.empty:
+            st.dataframe(benchmark.round(3), use_container_width=True, hide_index=True)
+            st.caption("Price-only reference by symbol and timeframe. Excludes dividends, fees, portfolio sizing, and cash allocation; it is not a portfolio-equivalent benchmark.")
+        else:
+            st.info("Benchmark data was unavailable for the selected symbols.")
 
         st.subheader("Chronological 70/30 research split")
         train = st.session_state.get("bt_train", pd.DataFrame())
@@ -234,12 +257,12 @@ if "bt_trades" in st.session_state:
             c1.metric("In-sample trades (70%)", len(train))
             c2.metric("Out-of-sample trades (30%)", len(test))
             st.caption("The final 30% is held out chronologically for a basic out-of-sample check. Do not tune rules against this holdout and then treat it as independent.")
-            st.dataframe(pd.DataFrame([
-                {"sample":"In-sample","trades":len(train),"win_rate_pct":(train["net_return_pct"]>0).mean()*100,
-                 "mean_trade_pct":train["net_return_pct"].mean()},
-                {"sample":"Out-of-sample","trades":len(test),"win_rate_pct":(test["net_return_pct"]>0).mean()*100,
-                 "mean_trade_pct":test["net_return_pct"].mean()},
-            ]).round(3), use_container_width=True, hide_index=True)
+            split_report = pd.concat([
+                summarize_sample_by_strategy(train, "In-sample"),
+                summarize_sample_by_strategy(test, "Out-of-sample"),
+            ], ignore_index=True)
+            if not split_report.empty:
+                st.dataframe(split_report.round(3), use_container_width=True, hide_index=True)
         else:
             st.info("Not enough distinct trade dates to form both in-sample and out-of-sample periods.")
 
