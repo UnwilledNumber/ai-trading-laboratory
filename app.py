@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples, apply_market_regimes, summarize_by_regime)
+from backtest import (run_backtest, simulate_portfolio, summarize_portfolio, summarize_by_strategy, make_walk_forward_split, build_benchmark_report, summarize_sample_by_strategy, audit_history_coverage, strategy_split_diagnostics, summarize_by_ticker, summarize_ticker_samples, apply_market_regimes, summarize_by_regime, optimize_strategy_parameters)
 
 from scanner import (
     fetch_universe, scan_market, load_watchlist, save_watchlist,
@@ -344,6 +344,107 @@ if "bt_trades" in st.session_state:
                 "market_regime_diagnostics.csv", "text/csv", use_container_width=True
             )
             st.caption("Trend regime uses SPY close versus EMA50 and EMA200. Volatility regime compares SPY ATR(14) percentage with trailing 252-session 33rd/67th percentiles. Regime labels are descriptive filters, not predictive signals. Intraday trades inherit the latest available daily SPY regime.")
+
+
+        st.subheader("Stage 3.7 — Strategy parameter research")
+        st.caption(
+            "Tests a small, predefined grid of minimum signal scores, ATR stop distances, "
+            "and reward targets. Configurations are ranked using the chronological training portion only; "
+            "the selected configuration's later holdout is reported separately and is not used for ranking."
+        )
+        with st.expander("Stage 3.7 settings", expanded=False):
+            opt_strategy = st.selectbox(
+                "Strategy to optimize",
+                ["Swing LONG", "Swing SHORT", "Day trading LONG", "Day trading SHORT"],
+                key="opt_strategy",
+            )
+            opt_horizon, opt_direction = opt_strategy.rsplit(" ", 1)
+            opt_min_trades = st.selectbox(
+                "Minimum in-sample trades per configuration", [10, 20, 30, 40],
+                index=1, key="opt_min_trades"
+            )
+            opt_slippage = st.selectbox(
+                "Optimization slippage per side (bps)", [0.0, 5.0, 10.0, 20.0],
+                index=1, key="opt_slippage"
+            )
+            opt_fees = st.selectbox(
+                "Optimization fees per side (bps)", [0.0, 0.5, 1.0, 2.0],
+                index=0, key="opt_fees"
+            )
+            run_optimizer = st.button(
+                "Run Stage 3.7 parameter research", type="primary", key="run_optimizer"
+            )
+        if run_optimizer:
+            opt_symbols = [s.strip().upper() for s in bt_symbols_text.split(",") if s.strip()]
+            if not opt_symbols:
+                st.error("Enter ticker symbols in the backtest settings before running optimization.")
+            else:
+                try:
+                    with st.spinner("Testing 27 parameter combinations. This may take several minutes on the first run…"):
+                        leaderboard, holdout, opt_train, opt_test = optimize_strategy_parameters(
+                            symbols=opt_symbols, horizon=opt_horizon,
+                            direction=opt_direction, score_values=[50, 60, 70],
+                            stop_values=[1.0, 1.5, 2.0],
+                            target_values=[1.5, 2.0, 3.0],
+                            min_train_trades=int(opt_min_trades),
+                            slippage_bps=float(opt_slippage),
+                            fee_bps_per_side=float(opt_fees),
+                        )
+                    st.session_state["opt_leaderboard"] = leaderboard
+                    st.session_state["opt_holdout"] = holdout
+                    st.session_state["opt_train"] = opt_train
+                    st.session_state["opt_test"] = opt_test
+                    st.session_state["opt_strategy_label"] = opt_strategy
+                except Exception as exc:
+                    st.error(f"Parameter research failed: {exc}")
+                    st.exception(exc)
+
+        if "opt_holdout" in st.session_state:
+            opt_holdout = st.session_state["opt_holdout"]
+            opt_leaderboard = st.session_state.get("opt_leaderboard", pd.DataFrame())
+            st.markdown(f"**Latest research: {st.session_state.get('opt_strategy_label', '')}**")
+            if opt_leaderboard.empty:
+                st.warning("No parameter combinations generated enough usable trades.")
+            else:
+                st.markdown("**In-sample configuration leaderboard**")
+                st.dataframe(opt_leaderboard.round(3), use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download in-sample optimization leaderboard (CSV)",
+                    opt_leaderboard.to_csv(index=False).encode("utf-8"),
+                    "stage3_7_training_leaderboard.csv", "text/csv", use_container_width=True
+                )
+            if opt_holdout.get("status", "").startswith("SELECTED"):
+                st.markdown("**Selected configuration — untouched chronological holdout**")
+                a, b, c = st.columns(3)
+                a.metric("Holdout trades", opt_holdout.get("trades", 0))
+                b.metric(
+                    "Holdout profit factor",
+                    f"{opt_holdout.get('profit_factor', np.nan):.2f}"
+                    if np.isfinite(opt_holdout.get("profit_factor", np.nan)) else "∞"
+                )
+                c.metric(
+                    "Holdout mean trade",
+                    f"{opt_holdout.get('mean_trade_pct', np.nan):.3f}%"
+                    if np.isfinite(opt_holdout.get("mean_trade_pct", np.nan)) else "N/A"
+                )
+                st.write(
+                    f"Selected settings: minimum score **{opt_holdout['selected_min_score']}**, "
+                    f"stop **{opt_holdout['selected_stop_atr']} ATR**, "
+                    f"target **{opt_holdout['selected_target_r']}R**."
+                )
+                st.write(
+                    f"Holdout win rate: **{opt_holdout.get('win_rate_pct', np.nan):.1f}%** · "
+                    f"Compounded candidate-trade return: **{opt_holdout.get('compounded_return_pct', np.nan):.2f}%** · "
+                    f"Max drawdown: **{opt_holdout.get('max_drawdown_pct', np.nan):.2f}%**"
+                )
+                st.caption(
+                    "Important: the holdout is a single historical split, not a live-performance guarantee. "
+                    "Do not repeatedly change the grid after viewing holdout results and continue calling that same period untouched. "
+                    "The ranking uses in-sample profit factor with mean return and drawdown as tie-breakers; "
+                    "this is a research ranking, not an automatically deployable strategy."
+                )
+            else:
+                st.warning(opt_holdout.get("status", "No configuration passed the minimum training sample rule."))
 
         st.write("**Trade log (portfolio allocations)**")
         display_cols = ["symbol","horizon","direction","signal_time","entry_time","exit_time",

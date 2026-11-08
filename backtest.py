@@ -810,3 +810,116 @@ def summarize_trades(trades: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
     t["equity_index"] = equity.values
     t["drawdown_pct"] = drawdown.values * 100
     return summary, t
+
+
+def _optimization_metrics(trades: pd.DataFrame) -> dict:
+    """Compact trade-level metrics for parameter research."""
+    if trades.empty:
+        return {"trades": 0, "win_rate_pct": np.nan, "profit_factor": np.nan,
+                "mean_trade_pct": np.nan, "compounded_return_pct": np.nan,
+                "max_drawdown_pct": np.nan}
+    ordered = trades.sort_values("exit_time").copy()
+    r = pd.to_numeric(ordered["net_return_pct"], errors="coerce").dropna()
+    if r.empty:
+        return {"trades": 0, "win_rate_pct": np.nan, "profit_factor": np.nan,
+                "mean_trade_pct": np.nan, "compounded_return_pct": np.nan,
+                "max_drawdown_pct": np.nan}
+    wins, losses = r[r > 0], r[r < 0]
+    gp, gl = float(wins.sum()), float(abs(losses.sum()))
+    pf = gp / gl if gl > 0 else (float("inf") if gp > 0 else 0.0)
+    curve = (1 + r / 100).cumprod()
+    dd = curve / curve.cummax() - 1
+    return {
+        "trades": int(len(r)),
+        "win_rate_pct": float((r > 0).mean() * 100),
+        "profit_factor": float(pf),
+        "mean_trade_pct": float(r.mean()),
+        "compounded_return_pct": float((curve.iloc[-1] - 1) * 100),
+        "max_drawdown_pct": float(dd.min() * 100),
+    }
+
+
+def optimize_strategy_parameters(
+    symbols: list[str],
+    horizon: str = "Swing",
+    direction: str = "LONG",
+    score_values: list[int] | None = None,
+    stop_values: list[float] | None = None,
+    target_values: list[float] | None = None,
+    min_train_trades: int = 20,
+    slippage_bps: float = 5.0,
+    fee_bps_per_side: float = 0.0,
+    train_fraction: float = 0.70,
+) -> tuple[pd.DataFrame, dict, pd.DataFrame, pd.DataFrame]:
+    """Grid-search parameters on chronological in-sample trades only.
+
+    Returns an in-sample-only leaderboard, the selected configuration's untouched
+    chronological holdout metrics, and its train/test trades. The holdout is not
+    used to rank configurations.
+    """
+    score_values = score_values or [50, 60, 70]
+    stop_values = stop_values or [1.0, 1.5, 2.0]
+    target_values = target_values or [1.5, 2.0, 3.0]
+    candidates = []
+    for score in score_values:
+        for stop in stop_values:
+            for target in target_values:
+                trades = run_backtest(
+                    symbols=symbols, horizon=horizon, direction=direction,
+                    min_score=int(score), min_price=2.0,
+                    min_dollar_volume=5_000_000, stop_atr=float(stop),
+                    target_r=float(target), slippage_bps=float(slippage_bps),
+                    fee_bps_per_side=float(fee_bps_per_side),
+                )
+                if trades.empty:
+                    continue
+                train, test = make_walk_forward_split(trades, train_fraction=train_fraction)
+                train_metrics = _optimization_metrics(train)
+                test_metrics = _optimization_metrics(test)
+                candidates.append({
+                    "min_score": int(score), "stop_atr": float(stop),
+                    "target_r": float(target), "train_trades": train_metrics["trades"],
+                    "train_win_rate_pct": train_metrics["win_rate_pct"],
+                    "train_profit_factor": train_metrics["profit_factor"],
+                    "train_mean_trade_pct": train_metrics["mean_trade_pct"],
+                    "train_compounded_return_pct": train_metrics["compounded_return_pct"],
+                    "train_max_drawdown_pct": train_metrics["max_drawdown_pct"],
+                    "_train": train, "_test": test,
+                    "_test_metrics": test_metrics,
+                })
+    if not candidates:
+        return pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame()
+
+    eligible = [c for c in candidates if c["train_trades"] >= int(min_train_trades)
+                and np.isfinite(c["train_profit_factor"])]
+    if not eligible:
+        # Do not silently select a tiny or infinite-PF sample.
+        leaderboard = pd.DataFrame([{k: v for k, v in c.items()
+                                      if not k.startswith("_")} for c in candidates])
+        leaderboard = leaderboard.sort_values(
+            ["train_trades", "train_mean_trade_pct"], ascending=[False, False]
+        ).reset_index(drop=True)
+        return leaderboard, {"status": "NO CONFIGURATION MET MINIMUM TRAINING SAMPLE",
+                             "configurations_tested": len(candidates)}, pd.DataFrame(), pd.DataFrame()
+
+    # Ranking uses in-sample PF, with mean return and drawdown as tie-breakers.
+    eligible.sort(key=lambda c: (
+        c["train_profit_factor"], c["train_mean_trade_pct"],
+        c["train_max_drawdown_pct"]
+    ), reverse=True)
+    best = eligible[0]
+    leaderboard = pd.DataFrame([{k: v for k, v in c.items()
+                                  if not k.startswith("_")} for c in eligible])
+    leaderboard = leaderboard.sort_values(
+        ["train_profit_factor", "train_mean_trade_pct"], ascending=[False, False]
+    ).reset_index(drop=True)
+    holdout = dict(best["_test_metrics"])
+    holdout.update({
+        "status": "SELECTED ON IN-SAMPLE ONLY; HOLDOUT NOT USED FOR RANKING",
+        "selected_min_score": best["min_score"],
+        "selected_stop_atr": best["stop_atr"],
+        "selected_target_r": best["target_r"],
+        "configurations_tested": len(candidates),
+        "eligible_configurations": len(eligible),
+    })
+    return leaderboard, holdout, best["_train"].copy(), best["_test"].copy()
